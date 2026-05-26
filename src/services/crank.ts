@@ -21,6 +21,7 @@ import {
 import { config, getConnection, getFallbackConnection, loadKeypair, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
+import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 
 const logger = createLogger("keeper:crank");
@@ -180,12 +181,21 @@ export class CrankService {
   private _totalCrankCycles = 0;
   // 6.2: Optional callback fired after each completed crank cycle
   private _onCrankCycle?: () => void;
+  /** LaserStream account loader — injected for event-driven account discovery. */
+  private readonly _accountLoader?: AccountLoader;
+  /** Timestamp of last full getProgramAccounts re-discover when streaming is active. */
+  private _lastFullRediscoverTime = 0;
+  private readonly _fullRediscoverIntervalMs: number;
 
-  constructor(oracleService: OracleService, intervalMs?: number) {
+  constructor(oracleService: OracleService, intervalMs?: number, accountLoader?: AccountLoader) {
     this.oracleService = oracleService;
     this.intervalMs = intervalMs ?? config.crankIntervalMs;
     this.inactiveIntervalMs = config.crankInactiveIntervalMs;
     this.discoveryIntervalMs = config.discoveryIntervalMs;
+    this._accountLoader = accountLoader;
+    this._fullRediscoverIntervalMs =
+      parseInt(process.env.KEEPER_FULL_REDISCOVER_INTERVAL_MS ?? "", 10) ||
+      30 * 60_000; // 30 min default
   }
 
   get isRunning(): boolean {
@@ -213,6 +223,61 @@ export class CrankService {
   }
 
   async discover(): Promise<DiscoveredMarket[]> {
+    // When the LaserStream loader is active and the feature flag is set,
+    // use the cache for the fast path. The slow-path full re-discover still
+    // runs every KEEPER_FULL_REDISCOVER_INTERVAL_MS (30 min default) so
+    // new markets are eventually picked up even under streaming.
+    if (
+      process.env.KEEPER_USE_LASERSTREAM === "true" &&
+      this._accountLoader
+    ) {
+      const now = Date.now();
+      const needsFullRediscover =
+        now - this._lastFullRediscoverTime >= this._fullRediscoverIntervalMs;
+      if (!needsFullRediscover) {
+        // Fast path: refresh account data for known markets from cache.
+        const cache = this._accountLoader.getCache();
+        const stats = this._accountLoader.getStats();
+        const currentSlot = stats.lastSlot;
+        // A.1: owner-verify every cache read against the loader's program ID
+        // so a corrupted stream message at a slab pubkey can't inject bytes
+        // into market state via the SDK parsers.
+        const expectedOwner = this._accountLoader.getProgramId();
+        let cacheHits = 0;
+        for (const [, state] of this.markets) {
+          const key = state.market.slabAddress.toBase58();
+          const entry = cache.getOwnerVerified(key, currentSlot, expectedOwner);
+          if (entry) {
+            // Re-parse the slab from cached bytes so the market state reflects
+            // the latest on-chain data without an RPC call.
+            try {
+              const { parseHeader, parseConfig, parseEngine, parseParams } = await import("@percolatorct/sdk");
+              const data = entry.data;
+              state.market.header = parseHeader(data);
+              state.market.config = parseConfig(data);
+              state.market.engine = parseEngine(data);
+              state.market.params = parseParams(data);
+              cacheHits++;
+            } catch {
+              // Ignore parse errors — market state stays at last known good.
+            }
+          }
+        }
+        this.lastDiscoveryTime = now;
+        logger.debug("LaserStream fast-path discover complete", {
+          knownMarkets: this.markets.size,
+          cacheHits,
+          nextFullRediscoverMs: this._lastFullRediscoverTime + this._fullRediscoverIntervalMs - now,
+        });
+        return Array.from(this.markets.values()).map((s) => s.market);
+      }
+      // Full rediscover time — fall through to standard getProgramAccounts path.
+      this._lastFullRediscoverTime = now;
+      logger.info("LaserStream: running periodic full re-discover", {
+        intervalMs: this._fullRediscoverIntervalMs,
+      });
+    }
+
     // PERC-HOTFIX: If MARKETS_FILTER is set, skip expensive getProgramAccounts discovery.
     // Instead, batch-fetch the slab accounts via getMultipleAccountsInfo on the fallback
     // RPC — one roundtrip per 100 slabs vs N sequential calls on the primary RPC (B15).
