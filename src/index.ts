@@ -7,9 +7,20 @@ import { CrankService } from "./services/crank.js";
 import { LiquidationService } from "./services/liquidation.js";
 import { AdlService } from "./services/adl.js";
 import { MonitorService } from "./services/monitor.js";
+import { FraudDetectorService } from "./services/fraud-detector.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
+import { assertMainnetProgramId } from "./lib/boot-assertions.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
+import { walletBalanceSol, activeMarketsCount, registerDefaultMetrics } from "./lib/metrics.js";
+import * as metricsServer from "./lib/metrics-server.js";
+import { getRedisClient } from "./lib/redis-client.js";
+import { LeaderLock, makeIdentity } from "./lib/leader.js";
+import { captureAndExit } from "./lib/exit-handlers.js";
+import { StartupTracker } from "./lib/startup-tracker.js";
+import { sharedTxQueue, DRAIN_TIMEOUT_MS } from "./lib/tx-queue.js";
+import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harness.js";
+import { sharedDecisionLog } from "./lib/decision-log.js";
 
 // Monitoring — alerts to Discord on threshold breaches
 export const monitors = createServiceMonitors("Keeper");
@@ -33,6 +44,7 @@ validateKeeperEnvGuards();
 // If NETWORK=mainnet, the keeper runs against mainnet program (requires FORCE_MAINNET=1).
 // On mainnet, HYPERP markets (SOL-PERP, BTC-PERP, ETH-PERP) use the keeper as oracle authority
 // and price lookups use mainnet mints directly (no mainnetCA override needed).
+assertMainnetProgramId({ isMainnet: isMainnet(), programId: config.programId });
 if (isMainnet()) {
   logger.info("Running in MAINNET mode", { programId: config.programId });
 }
@@ -43,6 +55,7 @@ const oracleService = new OracleService();
 const crankService = new CrankService(oracleService);
 const liquidationService = new LiquidationService(oracleService);
 const monitorService = new MonitorService();
+const fraudDetector = new FraudDetectorService(oracleService, () => crankService.getMarkets());
 
 // ADL service — gated by ADL_ENABLED=true env var until on-chain instruction
 // (PERC-8273 T8) is live and T10 devnet upgrade is done (PERC-8275).
@@ -54,9 +67,26 @@ if (adlEnabled) {
   logger.info("ADL service disabled — set ADL_ENABLED=true to enable (requires T8+T10)");
 }
 
-// Health state tracking
-let lastSuccessfulCrankTime = 0;
-let lastOracleUpdateTime = 0;
+// HA leader lock — null when HA_ENABLED is not set or KEEPER_REDIS_URL is absent
+const haEnabled = process.env.HA_ENABLED === "true";
+const redisClient = haEnabled ? getRedisClient() : null;
+const leaderLock: LeaderLock | null =
+  haEnabled && redisClient !== null
+    ? new LeaderLock(redisClient, makeIdentity(), {
+        ttlMs: Number(process.env.KEEPER_LEADER_LOCK_TTL_MS ?? 30_000),
+        renewMs: Number(process.env.KEEPER_LEADER_LOCK_RENEW_MS ?? 10_000),
+        pollMs: Number(process.env.KEEPER_STANDBY_POLL_MS ?? 5_000),
+      })
+    : null;
+
+if (haEnabled && redisClient === null) {
+  logger.warn("HA_ENABLED=true but KEEPER_REDIS_URL is unset — running as standalone leader");
+}
+
+// A5: gate /health on real readiness — Railway otherwise marks the container
+// healthy the moment the HTTP server binds, well before start() finishes
+// discovering markets and wiring services.
+const startupTracker = new StartupTracker();
 
 // Stale oracle pause guard — markets paused due to stale oracle data
 const stalePausedMarkets = new Set<string>();
@@ -78,6 +108,7 @@ const solBalanceCheckInterval = setInterval(async () => {
     const lamports = await conn.getBalance(keypair.publicKey);
     _keeperSolBalanceLamports = lamports;
     const solBalance = lamports / 1e9;
+    walletBalanceSol.set(solBalance);
 
     if (solBalance < SOL_BALANCE_WARN_THRESHOLD) {
       // Rate-limit alerts to once per 5 minutes to avoid Discord spam
@@ -86,7 +117,9 @@ const solBalanceCheckInterval = setInterval(async () => {
         logger.warn("Keeper SOL balance below threshold", {
           solBalance: solBalance.toFixed(4),
           thresholdSol: SOL_BALANCE_WARN_THRESHOLD,
-          walletAddress: keypair.publicKey.toBase58(),
+          // A8: truncate to match the Discord field below — full pubkey in logs is
+          // noise and exposes the keeper wallet identity to anyone with log access.
+          walletAddress: keypair.publicKey.toBase58().slice(0, 16) + "...",
         });
         sendWarningAlert("Keeper wallet SOL balance low", [
           { name: "Balance", value: `${solBalance.toFixed(4)} SOL`, inline: true },
@@ -102,6 +135,13 @@ const solBalanceCheckInterval = setInterval(async () => {
   }
 }, 60_000);
 solBalanceCheckInterval.unref();
+
+// B7: per-market cooldown so we don't fire a Discord critical every 60 s while
+// an oracle is stuck. The old aggregate alert reset only when the stale set
+// emptied, which never happened during a multi-hour DEX outage — channel got
+// nuked. Track last-alert per slab and re-fire only after STALE_ALERT_COOLDOWN_MS.
+const STALE_ALERT_COOLDOWN_MS = Number(process.env.KEEPER_STALE_ALERT_COOLDOWN_MS ?? 5 * 60_000);
+const lastStaleAlertByMarket = new Map<string, number>();
 
 const staleCheckInterval = setInterval(() => {
   // Skip stale checks during startup grace period (GH#29 — false CRITICAL floods on deploy)
@@ -127,10 +167,26 @@ const staleCheckInterval = setInterval(() => {
     }
   }
 
-  // Send alert for 5-min stale markets (includes paused ones)
-  if (alertStale.length > 0) {
+  // Recovered markets should drop their cooldown entry so a fresh staleness
+  // event re-alerts immediately rather than waiting for the cooldown window.
+  const alertSet = new Set(alertStale);
+  for (const market of Array.from(lastStaleAlertByMarket.keys())) {
+    if (!alertSet.has(market)) lastStaleAlertByMarket.delete(market);
+  }
+
+  // B7: per-market cooldown — gather the subset whose cooldown has elapsed.
+  const now = Date.now();
+  const toAlert: string[] = [];
+  for (const market of alertStale) {
+    const last = lastStaleAlertByMarket.get(market) ?? 0;
+    if (now - last >= STALE_ALERT_COOLDOWN_MS) {
+      lastStaleAlertByMarket.set(market, now);
+      toAlert.push(market);
+    }
+  }
+  if (toAlert.length > 0) {
     sendCriticalAlert("Oracle stale for markets", [
-      { name: "Stale Markets", value: alertStale.join(", "), inline: false },
+      { name: "Stale Markets", value: toAlert.join(", "), inline: false },
       { name: "Paused (>10min)", value: stalePausedMarkets.size.toString(), inline: true },
     ]).catch(() => {});
   }
@@ -168,18 +224,14 @@ crankService.setStalePauseCheck(isMarketStalePaused);
 // 6.2: Wire crank cycle counter into MonitorService so it can track ADL staleness
 crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 
-// Subscribe to crank events to track health
-crankService.getMarkets().forEach((_, slabAddress) => {
-  const checkCrankHealth = () => {
-    const markets = crankService.getMarkets();
-    for (const [_, state] of markets) {
-      if (state.lastCrankTime > lastSuccessfulCrankTime) {
-        lastSuccessfulCrankTime = state.lastCrankTime;
-      }
-    }
-  };
-  setInterval(checkCrankHealth, 10_000); // Check every 10s
-});
+// A4: deleted the per-market setInterval loop that used to live here. It was
+// unreachable: crankService.getMarkets() is called at module load time, before
+// discover() has populated the map, so the forEach iterated an empty Map and
+// registered zero intervals. The variables it wrote (lastSuccessfulCrankTime,
+// lastOracleUpdateTime) were never read — /health computes most-recent crank
+// time on every request from the live crank state.
+// activeMarketsCount metric is wired below in start() after markets are
+// discovered, then re-set whenever discover runs (via crankService internals).
 
 // Health endpoint
 const startupTime = Date.now();
@@ -340,6 +392,18 @@ res.writeHead(401, secureJsonHeaders);
   }
 
   if (req.url === "/health" && req.method === "GET") {
+    // A5: hard 503 until start() resolved. Railway otherwise marks the
+    // container healthy as soon as healthServer.listen() returns — long
+    // before discover() + service.start() have wired anything up.
+    if (!startupTracker.isReady()) {
+      res.writeHead(503, secureJsonHeaders);
+      res.end(JSON.stringify({
+        status: startupTracker.isFailed() ? "failed" : "starting",
+        failureReason: startupTracker.failureReason,
+      }));
+      return;
+    }
+
     const markets = crankService.getMarkets();
     const marketsTracked = markets.size;
     
@@ -414,6 +478,7 @@ res.writeHead(401, secureJsonHeaders);
 
     const healthData = {
       status,
+      role: leaderLock ? leaderLock.role() : "leader",
       lastCrankTime: mostRecentCrank,
       lastOracleUpdate: mostRecentOracle,
       marketsTracked,
@@ -444,18 +509,55 @@ res.writeHead(401, secureJsonHeaders);
       senderMetrics: snapshotSenderMetrics(),
     };
     
-    const statusCode = status === "down" ? 503 : 200; // "starting", "ok", "degraded" → 200
+    const currentRole = leaderLock ? leaderLock.role() : "leader";
+    // Standby nodes are healthy by definition — services intentionally not running
+    const statusCode = currentRole === "standby" ? 200 : status === "down" ? 503 : 200; // "starting", "ok", "degraded" → 200
     res.writeHead(statusCode, secureJsonHeaders);
     res.end(JSON.stringify(healthData));
+  } else if (req.url !== null && req.url !== undefined && (req.url === "/shadow/report" || req.url.startsWith("/shadow/report?")) && req.method === "GET") {
+    // GET /shadow/report?from=<epoch_ms>&to=<epoch_ms>
+    // Returns the current shadow-keeper comparison report.
+    // Only meaningful when SHADOW_HARNESS_ENABLED=true (DRY_RUN shadow deploy).
+    if (process.env.SHADOW_HARNESS_ENABLED !== "true") {
+      res.writeHead(200, secureJsonHeaders);
+      res.end(JSON.stringify({ enabled: false, message: "SHADOW_HARNESS_ENABLED is not set to true" }));
+      return;
+    }
+    const harness = sharedShadowHarness;
+    if (!harness) {
+      res.writeHead(503, secureJsonHeaders);
+      res.end(JSON.stringify({ error: "Shadow harness not initialized" }));
+      return;
+    }
+    void (async () => {
+      try {
+        const urlObj = new URL(req.url!, `http://localhost`);
+        const fromParam = urlObj.searchParams.get("from");
+        const toParam = urlObj.searchParams.get("to");
+        const fromMs = fromParam !== null ? Number(fromParam) : undefined;
+        const toMs = toParam !== null ? Number(toParam) : undefined;
+        const report = await harness.buildReport(
+          fromMs !== undefined && Number.isFinite(fromMs) ? fromMs : undefined,
+          toMs !== undefined && Number.isFinite(toMs) ? toMs : undefined,
+        );
+        res.writeHead(200, secureJsonHeaders);
+        res.end(JSON.stringify({ enabled: true, ...report }));
+      } catch (err) {
+        logger.error("/shadow/report error", { error: err instanceof Error ? err.message : String(err) });
+        res.writeHead(500, secureJsonHeaders);
+        res.end(JSON.stringify({ error: "Internal error" }));
+      }
+    })();
   } else {
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not Found");
   }
 });
 
-healthServer.listen(healthPort, () => {
-  logger.info("Health endpoint started", { port: healthPort });
-});
+// B13: do NOT bind the health port at module load. start() calls .listen()
+// after services are wired so Railway treats the missing port as unhealthy
+// during boot — without this, Railway flips to "healthy" the moment the
+// server binds (well before the keeper can actually crank anything).
 
 /**
  * Escalating retry delays for startup market discovery.
@@ -533,32 +635,121 @@ async function start() {
     logger.info("No markets found — keeper will idle and retry discovery each cycle. This is normal for fresh mainnet deployments.");
   }
 
-  crankService.start();
-  logger.info("Crank service started");
-  liquidationService.start(() => crankService.getMarkets());
-  logger.info("Liquidation scanner started");
-  monitorService.start(() => crankService.getMarkets());
-  logger.info("MonitorService started (invariant + ADL staleness checks)");
+  activeMarketsCount.set(markets.length);
 
-  // ADL service — starts only when ADL_ENABLED=true and markets are discovered.
-  // Depends on on-chain ExecuteAdl (tag 50) being live (T8/PERC-8273).
-  if (adlService) {
-    adlService.start(() => crankService.getMarkets());
-    logger.info("ADL service started");
+  async function startAllServices(): Promise<void> {
+    await crankService.start();
+    logger.info("Crank service started");
+    liquidationService.start(() => crankService.getMarkets());
+    logger.info("Liquidation scanner started");
+    monitorService.start(() => crankService.getMarkets());
+    logger.info("MonitorService started (invariant + ADL staleness checks)");
+    fraudDetector.start();
+    logger.info("FraudDetectorService started");
+
+    if (adlService) {
+      adlService.start(() => crankService.getMarkets());
+      logger.info("ADL service started");
+    }
   }
-  
+
+  function stopAllServices(): void {
+    if (adlService) {
+      adlService.stop();
+      logger.info("ADL service stopped (HA demote)");
+    }
+    crankService.stop();
+    logger.info("Crank service stopped (HA demote)");
+    liquidationService.stop();
+    logger.info("Liquidation service stopped (HA demote)");
+    monitorService.stop();
+    logger.info("MonitorService stopped (HA demote)");
+    fraudDetector.stop();
+    logger.info("FraudDetectorService stopped (HA demote)");
+  }
+
+  if (leaderLock) {
+    // A.3: env-guards asserts NETWORK is set to mainnet|devnet whenever
+    // HA_ENABLED=true, so the previous `?? "devnet"` fallback is gone —
+    // a missing NETWORK would silently share a lock with the wrong cluster.
+    const network = process.env.NETWORK!;
+    leaderLock.start({
+      network,
+      onPromote: () => {
+        logger.info("HA: promoted to leader — starting services", { network });
+        void startAllServices();
+      },
+      onDemote: (reason) => {
+        logger.warn("HA: demoted from leader — stopping services", { network, reason });
+        stopAllServices();
+      },
+    });
+    logger.info("HA leader election active", { network, haEnabled: true });
+  } else {
+    await startAllServices();
+  }
+
+  // B13: bind the health port only after every service is wired up. Wrapped in
+  // a Promise so start() awaits the bind callback before resolving — otherwise
+  // a concurrent /health probe could land between this call and start() resolving.
+  // In HA mode the health port still binds here; startupTracker reports
+  // "starting" until services actually wire up via onPromote.
+  await new Promise<void>((resolve, reject) => {
+    healthServer.once("error", reject);
+    healthServer.listen(healthPort, () => {
+      healthServer.off("error", reject);
+      logger.info("Health endpoint started", { port: healthPort });
+      resolve();
+    });
+  });
+
+  // F: Prometheus /metrics endpoint (loopback only — A.8). Default process metrics
+  // are registered separately so a metrics-scrape failure doesn't crash startup.
+  registerDefaultMetrics();
+  metricsServer.start();
+
+  // J: Shadow harness — only in DRY_RUN shadow deploys.
+  if (process.env.SHADOW_HARNESS_ENABLED === "true") {
+    const conn = (await import("@percolatorct/shared")).getConnection();
+    const harness = initSharedShadowHarness({
+      connection: conn,
+      readDecisions: (fromMs, toMs) => sharedDecisionLog.readWindow(fromMs, toMs),
+    });
+    harness.start();
+    logger.info("Shadow harness started", {
+      compareWindowMs: Number(process.env.SHADOW_HARNESS_COMPARE_WINDOW_MS ?? 300_000),
+      divergenceThresholdPct: Number(process.env.SHADOW_HARNESS_DIVERGENCE_THRESHOLD_PCT ?? 1.0),
+    });
+  }
+
   // Send startup alert
   await sendInfoAlert("Keeper service started", [
     { name: "Markets Tracked", value: markets.length.toString(), inline: true },
     { name: "Health Endpoint", value: `http://localhost:${healthPort}/health`, inline: true },
+    { name: "HA Mode", value: leaderLock ? "enabled" : "standalone", inline: true },
   ]).catch(() => {}); // Don't crash if alert fails
 }
 
-start().catch((err) => {
-  logger.error("Failed to start keeper", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
-  // Don't exit — keep the process alive for healthcheck + retry
-  logger.info("Keeper will stay alive for healthcheck despite startup error");
-});
+// A5: explicit success → ready, failure → captureAndExit. Previously a
+// start() rejection only logged and left the process up, which let Railway
+// keep marking the container healthy while no actual work was happening.
+start()
+  .then(() => {
+    startupTracker.markReady();
+    logger.info("Keeper start() resolved — health endpoint now reports ready");
+  })
+  .catch((err) => {
+    startupTracker.markFailed(err instanceof Error ? err.message : String(err));
+    captureAndExit("Failed to start keeper — exiting", err, {
+      capture: captureException,
+      logger,
+      exit: process.exit,
+      setTimer: (cb, ms) => {
+        const t = setTimeout(cb, ms);
+        t.unref();
+      },
+    });
+  });
 
 const SHUTDOWN_TIMEOUT_MS = 15_000;
 
@@ -576,12 +767,41 @@ async function shutdown(signal: string): Promise<void> {
     await sendInfoAlert("Keeper service shutting down", [
       { name: "Signal", value: signal, inline: true },
     ]);
-    
+
+    // Drain in-flight txs FIRST so they land before the leader lock is released
+    // and before the metrics server closes. This is the safest ordering:
+    //   txQueue.drain → leaderLock.stop → services.stop → healthServer → metricsServer
+    logger.info("Draining tx queue before shutdown", { timeoutMs: DRAIN_TIMEOUT_MS });
+    await sharedTxQueue.drain(DRAIN_TIMEOUT_MS);
+    const qStats = sharedTxQueue.getStats();
+    logger.info("Tx queue drained", {
+      liquidation: qStats.liquidation,
+      oracle: qStats.oracle,
+      crank: qStats.crank,
+    });
+
+    // J: Stop shadow harness and flush decision log before releasing leader lock.
+    if (sharedShadowHarness) {
+      sharedShadowHarness.stop();
+      logger.info("Shadow harness stopped");
+    }
+    await sharedDecisionLog.close();
+
     // Stop stale oracle + liquidation + SOL balance checks
     clearInterval(staleCheckInterval);
     clearInterval(liqStaleCheckInterval);
     clearInterval(solBalanceCheckInterval);
     monitorService.stop();
+
+    // Release leader lock so a standby can immediately take over
+    if (leaderLock) {
+      logger.info("Releasing leader lock");
+      await leaderLock.stop();
+    }
+
+    // Stop metrics server
+    logger.info("Closing metrics server");
+    await metricsServer.stop();
 
     // Close health server
     logger.info("Closing health server");
@@ -601,7 +821,11 @@ async function shutdown(signal: string): Promise<void> {
     // Stop crank service (clears timers, stops processing)
     logger.info("Stopping crank service");
     crankService.stop();
-    
+
+    // Stop fraud-detection loop
+    logger.info("Stopping fraud-detector service");
+    fraudDetector.stop();
+
     // Stop liquidation service (clears timers)
     logger.info("Stopping liquidation service");
     liquidationService.stop();
@@ -620,20 +844,26 @@ async function shutdown(signal: string): Promise<void> {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-// Safety net: catch any unhandled rejections or exceptions so Railway doesn't kill
-// the process mid-cycle. Log the error, but keep the keeper alive for healthcheck
-// and retry on the next interval. Without these handlers, Node.js 15+ exits on
-// unhandled rejections by default, causing the crash-loop seen in Railway logs.
-process.on("unhandledRejection", (reason, promise) => {
-  logger.error("Unhandled promise rejection — keeping process alive", {
-    reason: reason instanceof Error ? reason.message : String(reason),
-    stack: reason instanceof Error ? reason.stack : undefined,
-  });
+// A6: crash on unhandled rejections / exceptions. Previously we logged and kept
+// the process alive — but the keeper signs against live funds, and silent
+// recovery from an unhandled error risks operating with corrupt in-process
+// state (half-written maps, dangling promises holding resources). Better to
+// capture to Sentry, wait briefly for flush, then exit so Railway restarts a
+// clean process.
+const crashDeps = {
+  capture: captureException,
+  logger,
+  exit: process.exit,
+  setTimer: (cb: () => void, ms: number) => {
+    const t = setTimeout(cb, ms);
+    t.unref();
+  },
+};
+
+process.on("unhandledRejection", (reason) => {
+  captureAndExit("Unhandled promise rejection — exiting", reason, crashDeps);
 });
 
 process.on("uncaughtException", (err) => {
-  logger.error("Uncaught exception — keeping process alive", {
-    error: err.message,
-    stack: err.stack,
-  });
+  captureAndExit("Uncaught exception — exiting", err, crashDeps);
 });
