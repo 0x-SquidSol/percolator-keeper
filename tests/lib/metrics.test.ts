@@ -148,7 +148,8 @@ describe("metrics registry", () => {
     const lines = output.split("\n");
     for (const line of lines) {
       if (line.startsWith("#") || line.trim() === "") continue;
-      expect(line).toMatch(/^[a-z_]+(\{[^}]*\})?\s+[\d.+\-einfna]+(\s+\d+)?$/i);
+      // Prometheus metric-name spec: [a-zA-Z_:][a-zA-Z0-9_:]* — digits allowed after the first char.
+      expect(line).toMatch(/^[a-z_:][a-z0-9_:]*(\{[^}]*\})?\s+[\d.+\-einfna]+(\s+\d+)?$/i);
     }
   });
 });

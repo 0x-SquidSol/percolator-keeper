@@ -308,6 +308,58 @@ export const shadowDivergencePct = new Gauge({
   registers: [registry],
 });
 
+// ─── kind=2 (Polymarket-perp) linked-market registry ────────────────────────
+//
+// Track only actionable kind=2 slabs (linked, not force-closed, oracle_source
+// == 0). Downstream cranks (formula mirror, push cranker, force-close cranker)
+// iterate the registry.
+
+export const kind2RegistrySize = new Gauge({
+  name: "keeper_kind2_registry_size",
+  help: "Actionable kind=2 (Polymarket-perp) slabs currently tracked",
+  registers: [registry],
+});
+
+export const kind2RegistryReady = new Gauge({
+  name: "keeper_kind2_registry_ready",
+  help: "0/1 — set to 1 after the initial seed populates the registry",
+  registers: [registry],
+});
+
+export const kind2RegistryUpsertTotal = new Counter({
+  name: "keeper_kind2_registry_upsert_total",
+  help: "Registry upserts partitioned by source path (seed / stream / reconcile)",
+  labelNames: ["source"] as const,
+  registers: [registry],
+});
+
+export const kind2RegistryEvictTotal = new Counter({
+  name: "keeper_kind2_registry_evict_total",
+  help: "Registry evictions partitioned by reason (unlinked / resolved / unsupported_source / reconcile)",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+
+export const kind2RegistryReconcileDiffsTotal = new Counter({
+  name: "keeper_kind2_registry_reconcile_diffs_total",
+  help: "Diffs observed during reconcile, partitioned by kind (missing_from_chain / missing_from_memory / content_drift)",
+  labelNames: ["kind"] as const,
+  registers: [registry],
+});
+
+export const kind2RegistryReconcileLastDurationMs = new Gauge({
+  name: "keeper_kind2_registry_reconcile_last_duration_ms",
+  help: "Wall-clock duration of the most recent reconcile cycle",
+  registers: [registry],
+});
+
+export const kind2RegistryReconcileFailureTotal = new Counter({
+  name: "keeper_kind2_registry_reconcile_failure_total",
+  help: "Reconcile cycles that ended in error, partitioned by reason classification",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+
 export function registerDefaultMetrics(): void {
   collectDefaultMetrics({ register: registry, prefix: "nodejs_" });
 }
