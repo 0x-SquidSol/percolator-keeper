@@ -360,6 +360,68 @@ export const kind2RegistryReconcileFailureTotal = new Counter({
   registers: [registry],
 });
 
+// ─── kind=2 push cranker ────────────────────────────────────────────────
+//
+// Permissionless `PushOracleSnapshot` cranker for actionable kind=2 slabs.
+// Reads the bound Pyth `PriceUpdateV2`, gates on monotonic publish_time,
+// computes `p_yes_e6` via the K2' formula mirror, submits via the existing
+// keeper send path. Three rejection codes are tracked separately because
+// each carries different operational meaning:
+//   * stale = monotonic gate (expected; Pyth hasn't ticked)
+//   * deviation = formula mismatch (CRITICAL; our mirror has drifted)
+//   * resolved = market force-closed (deregister)
+
+export const kind2PushAttemptTotal = new Counter({
+  name: "keeper_kind2_push_attempt_total",
+  help: "PushOracleSnapshot submission attempts (post-gate)",
+  registers: [registry],
+});
+
+export const kind2PushSuccessTotal = new Counter({
+  name: "keeper_kind2_push_success_total",
+  help: "PushOracleSnapshot submissions that confirmed on-chain",
+  registers: [registry],
+});
+
+export const kind2PushSkippedTotal = new Counter({
+  name: "keeper_kind2_push_skipped_total",
+  help: "Push attempts skipped before tx build, partitioned by reason (gate / inflight / not_actionable / pyth_parse_fail / formula_fail)",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+
+export const kind2PushRejectTotal = new Counter({
+  name: "keeper_kind2_push_reject_total",
+  help: "PushOracleSnapshot submissions rejected by the wrapper, partitioned by classification (stale / deviation / resolved / other)",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+
+export const kind2PythReadFailTotal = new Counter({
+  name: "keeper_kind2_pyth_read_fail_total",
+  help: "Pyth account reads that returned no usable data (cache miss / wrong owner / parse fail)",
+  registers: [registry],
+});
+
+export const kind2WatchdogFireTotal = new Counter({
+  name: "keeper_kind2_watchdog_fire_total",
+  help: "Watchdog forced a fresh getAccountInfo because the cache was stale beyond the watchdog window",
+  registers: [registry],
+});
+
+export const kind2PushTickOverlapTotal = new Counter({
+  name: "keeper_kind2_push_tick_overlap_total",
+  help: "Number of ticks dropped because the previous tick was still in flight (cadence too tight)",
+  registers: [registry],
+});
+
+export const kind2PushTickDurationMs = new Histogram({
+  name: "keeper_kind2_push_tick_duration_ms",
+  help: "Wall-clock duration of each push-cranker tick",
+  buckets: [10, 50, 100, 250, 500, 1000, 2500, 5000],
+  registers: [registry],
+});
+
 export function registerDefaultMetrics(): void {
   collectDefaultMetrics({ register: registry, prefix: "nodejs_" });
 }

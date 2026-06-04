@@ -33,6 +33,7 @@
  */
 
 import { PublicKey, type Connection } from "@solana/web3.js";
+import { parseConfig } from "@percolatorct/sdk";
 import { createLogger } from "@percolatorct/shared";
 import { type AccountUpdate, type AccountLoader, type UnsubscribeFn } from "../lib/account-loader.js";
 import {
@@ -74,6 +75,15 @@ export interface Kind2Entry {
   readonly programId: string;
   /** Decoded kind=2 fields verbatim. */
   readonly fields: Kind2Fields;
+  /**
+   * 32-byte Pyth feed id (`MarketConfig.index_feed_id`). Read via the
+   * SDK's `parseConfig` because this is a legacy field with a stable
+   * SDK accessor — it predates the kind=2 extension and is not in
+   * `Kind2Fields`. Downstream cranks pass this to
+   * `derivePythPushOraclePDA` to find the on-chain `PriceUpdateV2`
+   * account bound to the market.
+   */
+  readonly pythFeedId: Uint8Array;
   /** Slot at which this entry's underlying data was observed. */
   readonly observedSlot: number;
   /** Which path produced this entry. */
@@ -374,10 +384,23 @@ export class Kind2Registry {
       // previously tracked.
       return null;
     }
+    // Pyth feed id lives on `MarketConfig.index_feed_id`, which is a
+    // legacy field the SDK already exposes. Read via the SDK accessor
+    // rather than hand-rolling another offset; downstream cranks need
+    // it to derive the Pyth account PDA. SDK parse failures here are
+    // recoverable — we skip this update; the registry's hot path will
+    // retry on the next slab account change.
+    let pythFeedId: Uint8Array;
+    try {
+      pythFeedId = parseConfig(data).indexFeedId.toBytes();
+    } catch {
+      return null;
+    }
     return {
       slab,
       programId,
       fields,
+      pythFeedId,
       observedSlot: slot,
       source,
     };
