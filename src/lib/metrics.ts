@@ -422,6 +422,53 @@ export const kind2PushTickDurationMs = new Histogram({
   registers: [registry],
 });
 
+// ─── kind=2 force-close cranker ─────────────────────────────────────────
+//
+// Permissionless `ForceCloseKind2` (tag 88) cranker. Each kind=2 market has
+// a configured `force_close_unix_timestamp`. Once that timestamp + a small
+// post-buffer + per-market jitter has elapsed, any caller can fire the
+// instruction and settle the market at the captured TWAP. One-shot
+// per-market — the first successful call wins; subsequent calls hit
+// `InvalidAccountData` (counted under `race_loss`, NOT errors).
+
+export const kind2ForceCloseEligible = new Gauge({
+  name: "keeper_kind2_force_close_eligible",
+  help: "Number of actionable markets currently within their fire window",
+  registers: [registry],
+});
+
+export const kind2ForceCloseAttemptTotal = new Counter({
+  name: "keeper_kind2_force_close_attempt_total",
+  help: "ForceCloseKind2 submissions attempted",
+  registers: [registry],
+});
+
+export const kind2ForceCloseSuccessTotal = new Counter({
+  name: "keeper_kind2_force_close_success_total",
+  help: "ForceCloseKind2 submissions that confirmed (we won the race)",
+  registers: [registry],
+});
+
+export const kind2ForceCloseRaceLossTotal = new Counter({
+  name: "keeper_kind2_force_close_race_loss_total",
+  help: "Submissions that returned InvalidAccountData (another caller already resolved the market)",
+  registers: [registry],
+});
+
+export const kind2ForceCloseRejectTotal = new Counter({
+  name: "keeper_kind2_force_close_reject_total",
+  help: "Submissions rejected for non-success non-race reasons, partitioned by classification (paused / not_yet_eligible / other)",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+
+export const kind2ForceCloseTickDurationMs = new Histogram({
+  name: "keeper_kind2_force_close_tick_duration_ms",
+  help: "Wall-clock duration of each force-close cranker tick",
+  buckets: [10, 50, 100, 250, 500, 1000, 2500, 5000],
+  registers: [registry],
+});
+
 export function registerDefaultMetrics(): void {
   collectDefaultMetrics({ register: registry, prefix: "nodejs_" });
 }
