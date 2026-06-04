@@ -39,6 +39,7 @@ import { createLogger, sendCriticalAlert } from "@percolatorct/shared";
 import { Kind2Registry, type Kind2Entry } from "./kind2-registry.js";
 import { pythPriceToPYesE6 } from "./kind2-formula.js";
 import { parsePythPriceUpdateV2, pythPriceToE6 } from "./kind2-pyth-parse.js";
+import { Kind2MetricsService } from "./kind2-metrics-service.js";
 import { AccountCache } from "../lib/account-cache.js";
 import { LeaderLock } from "../lib/leader.js";
 import { keeperSend, type KeeperSendResult } from "../lib/keeper-send.js";
@@ -160,11 +161,18 @@ export interface Kind2PushCrankerOptions {
   readonly p1DedupMs?: number;
   /** Per-tick concurrency for Promise.allSettled chunks. Default 32. */
   readonly perTickConcurrency?: number;
+  /**
+   * Optional metrics hook. When provided, the cranker calls
+   * `notePushSuccess(slab)` after each confirmed submit so the
+   * per-slab `last_push_age_secs` gauge can reset. Decoupled from the
+   * cranker's hot path — passing `undefined` is fine in tests.
+   */
+  readonly metrics?: Kind2MetricsService;
 }
 
 export class Kind2PushCranker {
   private readonly opts: Required<
-    Omit<Kind2PushCrankerOptions, "registry" | "cache" | "leader" | "connection" | "payer" | "programId" | "budget" | "getCurrentSlot">
+    Omit<Kind2PushCrankerOptions, "registry" | "cache" | "leader" | "connection" | "payer" | "programId" | "budget" | "getCurrentSlot" | "metrics">
   > & Kind2PushCrankerOptions;
   private readonly state = new Map<string, MarketState>();
   private tickTimer: NodeJS.Timeout | null = null;
@@ -335,6 +343,10 @@ export class Kind2PushCranker {
       st.consecFailures = 0;
       st.nextEligibleMs = 0;
       kind2PushSuccessTotal.inc();
+      // Stamp the per-slab last-push timestamp on the optional metrics
+      // service. Fire-and-forget; this is the only coupling between the
+      // cranker's hot path and dashboard observability.
+      this.opts.metrics?.notePushSuccess(slab);
     } catch (err) {
       this.handleSubmitError(slab, st, err, entry);
     } finally {

@@ -469,6 +469,36 @@ export const kind2ForceCloseTickDurationMs = new Histogram({
   registers: [registry],
 });
 
+// ─── kind=2 per-slab observability gauges ───────────────────────────────
+//
+// Two per-slab gauges that visualize this keeper's contribution to each
+// market's lifecycle:
+//   * `last_push_age_secs` — how long since OUR keeper last successfully
+//     landed a PushOracleSnapshot for this slab. NOT the ring's
+//     authoritative on-chain freshness — that's a separate concern. This
+//     measures whether OUR cranker is doing its job per-market.
+//   * `time_to_force_close_secs` — countdown (signed) to each market's
+//     `force_close_unix_timestamp`. Goes negative once the market is
+//     overdue but force-close has not yet fired.
+//
+// Both are updated by `Kind2MetricsService` on a periodic refresh tick
+// against the registry, and label-set-cleared on registry eviction so
+// retired markets don't leave stale series on the dashboard forever.
+
+export const kind2LastPushAgeSecs = new Gauge({
+  name: "keeper_kind2_last_push_age_secs",
+  help: "Seconds since this keeper last successfully landed PushOracleSnapshot for the slab",
+  labelNames: ["slab"] as const,
+  registers: [registry],
+});
+
+export const kind2TimeToForceCloseSecs = new Gauge({
+  name: "keeper_kind2_time_to_force_close_secs",
+  help: "Seconds until force_close_unix_timestamp for the slab (negative when overdue)",
+  labelNames: ["slab"] as const,
+  registers: [registry],
+});
+
 export function registerDefaultMetrics(): void {
   collectDefaultMetrics({ register: registry, prefix: "nodejs_" });
 }

@@ -615,6 +615,163 @@
       ],
       "title": "Shadow Harness Divergence % by TxType (No data until Workstream J)",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 108 },
+      "id": 111,
+      "title": "Kind=2 / Polymarket-Perp",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Number of actionable Polymarket-perp markets currently tracked by this keeper, alongside the count currently within their force-close fire window.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 109 },
+      "id": 112,
+      "options": { "graphMode": "area", "colorMode": "value", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "keeper_kind2_registry_size",
+          "legendFormat": "Linked markets"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "keeper_kind2_force_close_eligible",
+          "legendFormat": "In force-close window"
+        }
+      ],
+      "title": "Linked markets / force-close eligible",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Per-slab age since this keeper last successfully landed a PushOracleSnapshot. Yellow at 30s, red at 60s.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 30 },
+              { "color": "red", "value": 60 }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 109 },
+      "id": 113,
+      "options": { "legend": { "calcs": ["max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "keeper_kind2_last_push_age_secs",
+          "legendFormat": "{{slab}}"
+        }
+      ],
+      "title": "Last push age per slab",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Per-slab countdown to force_close_unix_timestamp. Negative means the on-chain force-close window is open; the cranker fires after post-buffer + jitter.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 109 },
+      "id": 114,
+      "options": { "legend": { "calcs": ["min"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "keeper_kind2_time_to_force_close_secs",
+          "legendFormat": "{{slab}}"
+        }
+      ],
+      "title": "Time to force-close per slab",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "PushOracleSnapshot outcomes by classification. Stale = monotonic gate (expected); deviation = our K2' formula has drifted from the on-chain recompute (P1 — investigate).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "ops"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 117 },
+      "id": 115,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(keeper_kind2_push_success_total[5m]))",
+          "legendFormat": "Success"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum by (reason)(rate(keeper_kind2_push_reject_total[5m]))",
+          "legendFormat": "Reject: {{reason}}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum by (reason)(rate(keeper_kind2_push_skipped_total[5m]))",
+          "legendFormat": "Skip: {{reason}}"
+        }
+      ],
+      "title": "Push outcomes (rate, 5m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "ForceCloseKind2 lifecycle. Success = we won the race; race-loss = another caller fired first (still a correct outcome).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "ops"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 117 },
+      "id": 116,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(keeper_kind2_force_close_success_total[5m]))",
+          "legendFormat": "Success"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(keeper_kind2_force_close_race_loss_total[5m]))",
+          "legendFormat": "Race loss"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum by (reason)(rate(keeper_kind2_force_close_reject_total[5m]))",
+          "legendFormat": "Reject: {{reason}}"
+        }
+      ],
+      "title": "Force-close outcomes (rate, 5m)",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

@@ -22,6 +22,17 @@ const REQUIRED_METRIC_NAMES = [
   // From Workstream G (must still be present)
   "keeper_rpc_provider_healthy",
   "keeper_rpc_failover_total",
+  // kind=2 (Polymarket-perp)
+  "keeper_kind2_registry_size",
+  "keeper_kind2_force_close_eligible",
+  "keeper_kind2_last_push_age_secs",
+  "keeper_kind2_time_to_force_close_secs",
+  "keeper_kind2_push_success_total",
+  "keeper_kind2_push_reject_total",
+  "keeper_kind2_push_skipped_total",
+  "keeper_kind2_force_close_success_total",
+  "keeper_kind2_force_close_race_loss_total",
+  "keeper_kind2_force_close_reject_total",
 ];
 
 describe("dashboards/keeper.json smoke tests", () => {
@@ -82,6 +93,16 @@ describe("dashboards/keeper.json smoke tests", () => {
     const ids = panels.map((p) => p.id as number);
     const uniqueIds = new Set(ids);
     expect(uniqueIds.size).toBe(ids.length);
+  });
+
+  it("contains a Kind=2 / Polymarket-Perp row", () => {
+    const raw = readFileSync(DASHBOARD_PATH, "utf-8");
+    dashboard = JSON.parse(raw) as Record<string, unknown>;
+    const panels = dashboard.panels as Array<Record<string, unknown>>;
+    const rowTitles = panels
+      .filter((p) => p.type === "row")
+      .map((p) => p.title as string);
+    expect(rowTitles).toContain("Kind=2 / Polymarket-Perp");
   });
 
   it("all panel types are one of the declared __requires types", () => {
