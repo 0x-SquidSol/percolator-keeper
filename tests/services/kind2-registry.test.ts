@@ -278,3 +278,57 @@ describe("Kind2Registry — seed + reconcile", () => {
     expect(registry.isReady()).toBe(true);
   });
 });
+
+describe("Kind2Registry — full-slab decoder slice", () => {
+  // Regression guard: production slabs carry CONFIG + engine + risk_buf +
+  // gen_table (tens of KB). The decoder reads end-relative offsets that
+  // are only valid against the CONFIG region; slicing to end-of-buffer
+  // makes every field read from gen_table garbage. Buffer kind=2 fields
+  // at end-of-CONFIG (NOT end-of-buffer) and trailing bytes are non-zero
+  // garbage — both conditions are required to catch the original bug.
+  function buildFullSlab(overrides: Parameters<typeof buildSlab>[0] = {}): Uint8Array {
+    const config = buildSlab(overrides);
+    const trailingLen = 8 * 1024; // representative engine+risk_buf+gen_table
+    const full = new Uint8Array(config.length + trailingLen);
+    full.set(config, 0);
+    for (let i = config.length; i < full.length; i++) {
+      full[i] = (i & 0xff) || 0x77; // non-zero garbage so a wrong slice fails loudly
+    }
+    return full;
+  }
+
+  it("decodes kind=2 fields correctly when slab carries engine+gen_table suffix", () => {
+    const loader = new FakeLoader();
+    const registry = new Kind2Registry({
+      programIds: [PROGRAM_ID],
+      connection: mockConnection([]),
+      reconcileMs: 0,
+    });
+    // Sync seed-then-attach for the test harness.
+    return registry.seedAndAttach(loader.asLoader()).then(() => {
+      const bytes = buildFullSlab({
+        polymarketConditionId: seq(0xa0),
+        oracleSource: 0,
+        pythThresholdE6: 150_000_000_000n,
+        pythScaleBpsPerPct: 5_000,
+        valueDeviationBps: 500,
+        forceCloseUnixTimestamp: 1_780_000_000n,
+        forcedClosePriceE6: 0n,
+        councilAuthority: seq(0xb0),
+        metadataUriHash: seq(0xc0),
+        linkedAtSlot: 1_000n,
+      });
+      loader.fireUpdate(makeUpdate(SLAB_A, bytes, 100));
+      expect(registry.size()).toBe(1);
+      const entry = registry.get(SLAB_A.toBase58())!;
+      expect(entry.fields.oracleSource).toBe(0);
+      expect(entry.fields.pythThresholdE6).toBe(150_000_000_000n);
+      expect(entry.fields.linkedAtSlot).toBe(1_000n);
+      // Field values would be unrecognisable garbage if the slice still
+      // extended to end-of-buffer.
+      expect(Array.from(entry.fields.polymarketConditionId)).toEqual(
+        Array.from(seq(0xa0)),
+      );
+    });
+  });
+});

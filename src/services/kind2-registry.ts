@@ -33,12 +33,13 @@
  */
 
 import { PublicKey, type Connection } from "@solana/web3.js";
-import { parseConfig } from "@percolatorct/sdk";
+import { parseConfig, detectSlabLayout } from "@percolatorct/sdk";
 import { createLogger } from "@percolatorct/shared";
 import { type AccountUpdate, type AccountLoader, type UnsubscribeFn } from "../lib/account-loader.js";
 import {
   decodeKind2Fields,
   classifyKind2,
+  KIND2_MIN_CONFIG_LEN,
   type Kind2Fields,
   type Kind2Status,
 } from "./kind2-decoder.js";
@@ -442,26 +443,30 @@ export class Kind2Registry {
 // ─── Local helpers ───────────────────────────────────────────────────────
 
 /**
- * Slice the `MarketConfig` region out of a full slab buffer. The header
- * is 136 bytes; the config starts immediately after. The config region
- * runs up to but not including the engine state. Without a robust
- * per-layout config-len helper in the shipped SDK, we slice from
- * HEADER_LEN to the end and trust that the decoder's end-relative
- * offsets land on `_pad_governance` rather than on engine state.
- *
- * This is safe only for the V13+ layouts that produce slabs whose
- * MarketConfig is the final variable-length region; earlier layouts
- * (and post-V13 future extensions appended past the config) would
- * need a per-layout slice. Mitigated by `decodeKind2Fields` returning
- * `null` if the slice is too short and by the classifier rejecting
- * inconsistent fields.
- *
- * TODO(SDK 3.0): replace with the SDK's typed `MarketConfig` accessor
- * for the kind=2 fields, which will know each layout's config-len.
+ * Slice the `MarketConfig` region out of a full slab buffer. Prefers the
+ * SDK's `detectSlabLayout` (authoritative configOffset/configLen per
+ * tier); falls back to the V13 `[HEADER_LEN, HEADER_LEN+KIND2_MIN_CONFIG_LEN)`
+ * window when the layout is unrecognised. The fallback is a known-loud
+ * code-path: a structurally unrecognised slab is a strong signal of
+ * either upstream layout drift or a corrupted account, so we log once
+ * per slab-length so it shows up in alerts without flooding the log.
  */
+const warnedSlabLengths = new Set<number>();
 function extractConfigRegion(slabData: Uint8Array): Uint8Array {
-  if (slabData.length <= SLAB_HEADER_LEN) return new Uint8Array(0);
-  return slabData.subarray(SLAB_HEADER_LEN);
+  const layout = detectSlabLayout(slabData.length, slabData);
+  if (layout !== null) {
+    const end = layout.configOffset + layout.configLen;
+    if (slabData.length < end) return new Uint8Array(0);
+    return slabData.subarray(layout.configOffset, end);
+  }
+  if (!warnedSlabLengths.has(slabData.length)) {
+    warnedSlabLengths.add(slabData.length);
+    logger.warn("slab layout unrecognised by SDK; using V13 fallback slice", {
+      slabLen: slabData.length,
+    });
+  }
+  if (slabData.length < SLAB_HEADER_LEN + KIND2_MIN_CONFIG_LEN) return new Uint8Array(0);
+  return slabData.subarray(SLAB_HEADER_LEN, SLAB_HEADER_LEN + KIND2_MIN_CONFIG_LEN);
 }
 
 function sameFields(a: Kind2Fields, b: Kind2Fields): boolean {
