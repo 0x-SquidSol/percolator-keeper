@@ -348,7 +348,7 @@ export class Kind2PushCranker {
       // cranker's hot path and dashboard observability.
       this.opts.metrics?.notePushSuccess(slab);
     } catch (err) {
-      this.handleSubmitError(slab, st, err, entry);
+      this.handleSubmitError(slab, st, err, entry, parsed.publishTime);
     } finally {
       st.inflight = false;
     }
@@ -423,13 +423,21 @@ export class Kind2PushCranker {
     );
   }
 
-  private handleSubmitError(slab: string, st: MarketState, err: unknown, entry: Kind2Entry): void {
+  private handleSubmitError(
+    slab: string,
+    st: MarketState,
+    err: unknown,
+    entry: Kind2Entry,
+    publishTime: bigint,
+  ): void {
     const kind = classifyReject(err);
     kind2PushRejectTotal.inc({ reason: kind });
     if (kind === "stale") {
-      // Expected when our local watermark trailed the on-chain ring
-      // (e.g. cold start). Bump the local watermark to the cached
-      // Pyth observation so we don't re-submit until Pyth advances.
+      // Local watermark trailed the on-chain ring (cold start, or a
+      // racing keeper landed our publishTime first). Bump the watermark
+      // to the submitted publishTime so we don't re-fetch + re-submit
+      // the same observation every tick — wait for Pyth to advance.
+      st.lastSubmittedPublishTime = publishTime;
       return;
     }
     if (kind === "resolved") {

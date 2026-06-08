@@ -204,6 +204,34 @@ describe("Kind2PushCranker — gate + submit", () => {
     // Tick swallows the error; no throw escaped.
   });
 
+  it("advances watermark on OracleStale so it doesn't re-submit the same publishTime", async () => {
+    // Regression for stale-retry infinite-loop bug: pre-fix the cranker
+    // returned from the stale branch without updating
+    // lastSubmittedPublishTime, so every subsequent tick re-fetched the
+    // SAME Pyth observation and re-submitted it forever.
+    const entry = entryFor(SLAB_A);
+    const pythPubkey = new PublicKey(new Uint8Array(32).fill(7)).toBase58();
+    const publishTime = 1_700_000_000n;
+    cache.set(pythPubkey, buildPythBytes(publishTime, 10_000_000_000_000n, -8), "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ", 1_000);
+    registry.set([entry]);
+
+    // First tick: submit succeeds in being called, returns OracleStale.
+    sendMock.mockRejectedValueOnce(
+      Object.assign(new Error("Transaction failed: custom program error: 0x6"), {
+        logs: ["Program log: PushOracleSnapshot: publish_time=X not greater than ring_last=Y (replay/stale)"],
+      }),
+    );
+    await cranker.tick();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+
+    // Second tick with the SAME publishTime: the watermark advanced on
+    // the stale rejection, so the off-chain gate at parsed.publishTime
+    // <= lastSubmittedPublishTime now short-circuits before submit.
+    sendMock.mockClear();
+    await cranker.tick();
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
   it("classifies OracleInvalid (deviation) rejection and parks the market", async () => {
     const entry = entryFor(SLAB_A);
     const pythPubkey = new PublicKey(new Uint8Array(32).fill(7)).toBase58();
