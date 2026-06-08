@@ -249,12 +249,17 @@ export class MonitorService {
         }
 
         // ── 6.3: ADL staleness ─────────────────────────────────────────────
-        // Check if ADL is needed by comparing pnl_pos_tot against max_pnl_cap.
+        // ADL is admissible on-chain ONLY when the insurance fund is fully
+        // depleted (percolator.rs:14590 InsuranceFundNotDepleted) AND profit
+        // exceeds the cap (percolator.rs:14604). Both conditions are required —
+        // gating on pnl>cap alone produced false "ADL needed" alerts for healthy
+        // markets whose insurance fund still held a balance.
         // We reuse the data already fetched above.
         const { pnlPosTot } = engine;
         // maxPnlCap lives on MarketConfig (parseConfig), already parsed above.
         const maxPnlCap = cfg.maxPnlCap;
-        const adlNeeded = maxPnlCap > 0n && pnlPosTot > maxPnlCap;
+        const insuranceDepleted = engine.insuranceFund.balance === 0n;
+        const adlNeeded = insuranceDepleted && maxPnlCap > 0n && pnlPosTot > maxPnlCap;
 
         const mState = this._getOrCreatePerMarket(slabAddress);
         const cyclesSinceLastAdl = adlNeeded
@@ -274,21 +279,26 @@ export class MonitorService {
         this._adlStalenessResults.set(slabAddress, adlResult);
 
         if (stale) {
-          logger.warn("ADL needed but no ADL tx sent recently", {
+          // ExecuteAdl is admin/multisig-gated on-chain — the keeper does NOT
+          // execute it (see services/adl.ts). A persistent adlNeeded means an
+          // admin/multisig deleverage action is overdue, not that the keeper stalled.
+          logger.warn("ADL conditions persist — admin/multisig action overdue", {
             slabAddress,
             pnlPosTot: pnlPosTot.toString(),
             maxPnlCap: maxPnlCap.toString(),
+            insuranceFundBalance: engine.insuranceFund.balance.toString(),
             cyclesSinceLastAdl,
             threshold: ADL_STALENESS_CYCLE_THRESHOLD,
           });
 
           if (now - mState.lastAdlStalenessAlert > ALERT_COOLDOWN_MS) {
             mState.lastAdlStalenessAlert = now;
-            sendWarningAlert("ADL needed but keeper has not executed it recently", [
+            sendWarningAlert("ADL conditions met — admin/multisig action required", [
               { name: "Market", value: slabAddress.slice(0, 16) + "...", inline: false },
               { name: "pnl_pos_tot", value: pnlPosTot.toString(), inline: true },
               { name: "max_pnl_cap", value: maxPnlCap.toString(), inline: true },
-              { name: "Cycles without ADL tx", value: cyclesSinceLastAdl.toString(), inline: true },
+              { name: "insurance_balance", value: engine.insuranceFund.balance.toString(), inline: true },
+              { name: "Cycles persisting", value: cyclesSinceLastAdl.toString(), inline: true },
             ]).catch(() => {});
           }
         }

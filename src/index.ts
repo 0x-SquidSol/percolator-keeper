@@ -57,14 +57,17 @@ const liquidationService = new LiquidationService(oracleService);
 const monitorService = new MonitorService();
 const fraudDetector = new FraudDetectorService(oracleService, () => crankService.getMarkets());
 
-// ADL service — gated by ADL_ENABLED=true env var until on-chain instruction
-// (PERC-8273 T8) is live and T10 devnet upgrade is done (PERC-8275).
+// ADL service — OBSERVE-ONLY, gated by ADL_ENABLED=true.
+// ExecuteAdl is admin/multisig-gated on-chain (require_admin + insurance must be
+// fully depleted); the keeper does NOT send it. Protective deleveraging happens
+// permissionlessly inside KeeperCrank/LiquidateAtOracle. This service only reports
+// when on-chain ADL preconditions are met. See services/adl.ts header.
 const adlEnabled = process.env.ADL_ENABLED === "true";
 const adlService = adlEnabled ? new AdlService() : null;
 if (adlEnabled) {
-  logger.info("ADL service enabled (ADL_ENABLED=true)");
+  logger.info("ADL service enabled (observe-only — ExecuteAdl is admin/multisig-gated)");
 } else {
-  logger.info("ADL service disabled — set ADL_ENABLED=true to enable (requires T8+T10)");
+  logger.info("ADL service disabled — set ADL_ENABLED=true for observe-only ADL monitoring");
 }
 
 // HA leader lock — null when HA_ENABLED is not set or KEEPER_REDIS_URL is absent
@@ -453,17 +456,15 @@ res.writeHead(401, secureJsonHeaders);
       }
     }
     
-    // ADL stats
+    // ADL stats — observe-only (ExecuteAdl is admin/multisig-gated; keeper does not send)
     let adlStats: Record<string, unknown> | null = null;
     if (adlService) {
       const stats = adlService.getStats();
-      let totalAdlTxSent = 0;
-      let activeMarkets = 0;
+      let marketsNeedingAdl = 0;
       for (const [, s] of stats) {
-        totalAdlTxSent += s.adlTxSent;
-        if (s.adlTxSent > 0) activeMarkets++;
+        if (s.adlNeeded) marketsNeedingAdl++;
       }
-      adlStats = { enabled: true, totalAdlTxSent, activeMarkets };
+      adlStats = { enabled: true, mode: "observe-only", marketsNeedingAdl };
     } else {
       adlStats = { enabled: false };
     }
@@ -649,7 +650,7 @@ async function start() {
 
     if (adlService) {
       adlService.start(() => crankService.getMarkets());
-      logger.info("ADL service started");
+      logger.info("ADL service started (observe-only)");
     }
   }
 
