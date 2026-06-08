@@ -279,6 +279,61 @@ describe("Kind2Registry — seed + reconcile", () => {
   });
 });
 
+describe("Kind2Registry — reconcile vs stream race", () => {
+  it("does not evict a slab that the stream inserts while reconcile is in flight", async () => {
+    // Regression for the stream-vs-reconcile race:
+    //   1. Reconcile snapshots `this.entries` (empty) and starts the RPC fetch.
+    //   2. Stream fires an upsert for SLAB_A *during* the fetch.
+    //   3. RPC returns with NO accounts (the stream observation hasn't yet
+    //      reached the RPC's "confirmed" view).
+    //   4. Pre-fix: the diff walked `this.entries`, saw SLAB_A as
+    //      missing-from-chain, evicted it. Stream re-inserts on next tick.
+    //   5. Post-fix: the diff walks the scan-start SNAPSHOT (which was empty),
+    //      so SLAB_A is not a candidate for eviction at all.
+    const loader = new FakeLoader();
+
+    // First call (seed) returns empty immediately; subsequent calls
+    // (reconcile) block on the deferred so the stream can race with them.
+    let callCount = 0;
+    let resolveRpc: () => void = () => {};
+    const rpcReady = new Promise<void>((r) => { resolveRpc = r; });
+    const conn = {
+      getProgramAccounts: vi.fn(async () => {
+        callCount++;
+        if (callCount === 1) return []; // seed
+        await rpcReady;
+        return []; // reconcile sees no accounts
+      }),
+    } as unknown as Connection;
+
+    const registry = new Kind2Registry({
+      programIds: [PROGRAM_ID],
+      connection: conn,
+      reconcileMs: 0,
+    });
+    await registry.seedAndAttach(loader.asLoader());
+    expect(registry.size()).toBe(0);
+
+    // Kick off a reconcile but do NOT await yet — the RPC is gated.
+    const reconcilePromise = registry.reconcileNow();
+
+    // Yield once so reconcile reaches the await inside getProgramAccounts.
+    await Promise.resolve();
+
+    // Stream fires while reconcile is mid-flight.
+    loader.fireUpdate(makeUpdate(SLAB_A, actionableSlabBytes(), 100));
+    expect(registry.size()).toBe(1);
+
+    // Release the RPC (returns empty); let reconcile finish.
+    resolveRpc();
+    await reconcilePromise;
+
+    // The stream-inserted slab must still be there. Pre-fix this was 0.
+    expect(registry.size()).toBe(1);
+    expect(registry.get(SLAB_A.toBase58())).toBeTruthy();
+  });
+});
+
 describe("Kind2Registry — full-slab decoder slice", () => {
   // Regression guard: production slabs carry CONFIG + engine + risk_buf +
   // gen_table (tens of KB). The decoder reads end-relative offsets that

@@ -174,6 +174,14 @@ export class Kind2Registry {
   }
 
   /**
+   * Manually trigger one reconcile cycle. Useful for ops (force a sync
+   * before a runbook step) and exposes the path to unit tests.
+   */
+  reconcileNow(): Promise<void> {
+    return this.reconcileWithRpc();
+  }
+
+  /**
    * Leader-only: begin the periodic reconcile loop. Idempotent — calling
    * twice does not start two timers. Standby keepers should NOT call
    * this; their reconcile cadence is the leader's responsibility.
@@ -274,6 +282,13 @@ export class Kind2Registry {
    */
   private async reconcileWithRpc(): Promise<void> {
     const t0 = Date.now();
+    // Snapshot the registry's view at scan-start. The stream can upsert
+    // new entries while getProgramAccounts is in flight; without the
+    // snapshot those entries appear missing-from-chain in the diff below
+    // and get evicted, then re-inserted by the next stream tick — a
+    // bouncing oscillation. Iterating the snapshot for the eviction
+    // pass ensures stream-added slabs are not candidates for eviction.
+    const scanStartEntries = new Map(this.entries);
     const observed = new Map<string, Kind2Entry>();
     for (const programId of this.opts.programIds) {
       try {
@@ -299,11 +314,15 @@ export class Kind2Registry {
         return; // bail without mutating registry on a partial scan
       }
     }
-    // Diff: missing_from_chain (registry has it, RPC doesn't), missing_from_memory
+    // Diff: missing_from_chain (snapshot had it, RPC didn't), missing_from_memory
     // (RPC has it, registry doesn't), and content_drift (both present, different).
-    for (const [slab, existing] of this.entries) {
+    for (const [slab, existing] of scanStartEntries) {
       const fresh = observed.get(slab);
       if (!fresh) {
+        // Double-check the slab is still in the live registry — the
+        // stream may have already evicted/replaced it during the scan,
+        // in which case this stale snapshot opinion is no longer valid.
+        if (!this.entries.has(slab)) continue;
         kind2RegistryReconcileDiffsTotal.inc({ kind: "missing_from_chain" });
         this.evict(slab, "reconcile");
       } else if (!sameFields(existing.fields, fresh.fields)) {
@@ -311,6 +330,8 @@ export class Kind2Registry {
         this.upsert(fresh);
       }
     }
+    // missing-from-memory pass walks the live registry (not the snapshot)
+    // so stream-added entries during the scan are correctly skipped.
     for (const [slab, fresh] of observed) {
       if (!this.entries.has(slab)) {
         kind2RegistryReconcileDiffsTotal.inc({ kind: "missing_from_memory" });
