@@ -50,9 +50,9 @@ There is no kind=2-specific feature flag — the registry boots if the keeper bo
 
 The admin must execute these instructions **in this exact order** — each step gates the next (the wrapper enforces these orderings on-chain):
 
-1. `InitMarket` — creates the slab. **Important:** the `index_feed_id` constructor argument must be the 32-byte Pyth feed id for this market. There is no separate setter — if you forget here, you must `CloseSlab` and re-init. `market_kind` defaults to `0`; `LinkPolymarketMarket` (step 3) lifts it to `2`.
-2. `SetCouncilAuthority` (tag 89) — admin + incoming-council both sign. Sets `config.council_authority`. Required before Link will accept the co-signed call.
-3. `LinkPolymarketMarket` (tag 84) — admin + council co-signed. Supplies `condition_id`, `oracle_source` (must be `0`/Pyth for V1), and `metadata_uri_hash`. The handler validates the bound Pyth account at this point (`oracle::validate_pyth_feed_account`), so the Pyth account must be passed as the 4th `AccountInfo`. The handler also lifts `engine.params.market_kind` to `2`, which switches the engine's notional formula to the side-aware branch.
+1. `InitMarket` — creates the slab. **Important:** the `index_feed_id` constructor argument must be the 32-byte Pyth feed id for this market. There is no separate setter — if you forget here, you must `CloseSlab` and re-init. `market_kind` defaults to `0`; `SetCouncilAuthority` (step 2) atomically lifts it to `2`.
+2. `SetCouncilAuthority` (tag 89) — admin + incoming-council both sign. Writes `config.council_authority` AND lifts `config.market_kind` from `0` to `2` in the same instruction (the kind-lift is bundled here so every kind=2 slab is born with a valid council co-signer — there is no kind=2-without-council intermediate state). Switches the engine's notional formula to the side-aware branch.
+3. `LinkPolymarketMarket` (tag 84) — admin + council co-signed. Supplies `condition_id`, `oracle_source` (must be `0`/Pyth for V1), and `metadata_uri_hash`. Requires `market_kind == 2` already set by step 2. The handler validates the bound Pyth account at this point (`oracle::validate_pyth_feed_account`), so the Pyth account must be passed as the 4th `AccountInfo`.
 4. `SetPythPriceMapping` (tag 86) — admin + council co-signed. Sets `pyth_threshold_e6`, `pyth_scale_bps_per_pct`, and `value_deviation_bps` together. The K2' formula mirror reads the first two; the wrapper's on-chain recompute uses all three.
 5. `SetForceCloseTimestamp` (tag 87) — admin + council co-signed. Unix-seconds, **at least 7 days past expected Polymarket resolution**. The K4' cranker fires here regardless of resolution state. There is no undo.
 6. **Wait 24h** for the activation timelock. The user-entry handlers reject new account creation until `clock.slot >= linked_at_slot + MIN_ACTIVATION_DELAY_SLOTS`. The keeper does NOT gate on this — push attempts begin immediately so the ring is populated when user entry opens.
@@ -142,9 +142,9 @@ solana logs <PROGRAM_ID> | grep -A 2 -i 'deviation\|oracleinvalid'
 
 **Remediation:**
 
-- If diagnostic (1) — admin re-runs `SetKind2Threshold` / `SetKind2Scale` with the correct values. K3' resumes on its next tick.
+- If diagnostic (1) — `SetPythPriceMapping` (tag 86) writes `pyth_threshold_e6`, `pyth_scale_bps_per_pct`, and `value_deviation_bps` in a single instruction and is **one-shot per slab** (refuses to overwrite once `value_deviation_bps != 0`). If the mapping is wrong AND the slab is empty (`num_used_accounts == 0`), admin must close the slab and recreate from `InitMarket`. If the slab is non-empty, the market must run to force-close at the existing (wrong) mapping; truncate user exposure by calling `SetForceCloseTimestamp` to `now() + MIN_FUTURE_SECS` (48h). There is no in-place repair.
 - If diagnostic (2) — **stop the world.** Page protocol engineer; the K2' formula in `src/services/kind2-formula.ts` must be reconciled with the on-chain `handle_push_oracle_snapshot` before the keeper resumes. Until the fix lands, the rejecting market will eventually force-close itself at the captured TWAP — capital is not at immediate risk.
-- If diagnostic (3) — the admin must `SetIndexFeedId` to the right feed, then the market must continue (or be force-closed early via a one-off `SetForceCloseTimestamp` to `now() + 60s`).
+- If diagnostic (3) — `index_feed_id` is set at `LinkPolymarketMarket` (tag 84) time and is also one-shot per slab. Same recovery path as (1): if empty, close + recreate; if non-empty, schedule early force-close via `SetForceCloseTimestamp` (tag 87).
 
 **Escalation:** Page protocol engineer immediately if (a) more than one market shows deviation rejections simultaneously, or (b) the rejecting market has any open positions. Single-market deviation on an empty market = ticket, not page.
 
