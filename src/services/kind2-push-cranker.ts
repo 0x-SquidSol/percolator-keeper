@@ -368,6 +368,12 @@ export class Kind2PushCranker {
     for (const entry of entries) {
       const st = this.getState(entry.slab);
       if (st.inflight) continue;
+      // Never-pushed markets are the regular tick's responsibility; the
+      // watchdog is a latent failsafe for "was pushing then stalled", not
+      // a cold-start primer. Without this guard, getState's lastSubmitMs=0
+      // makes `now - 0 > watchdogStaleMs` true for every fresh market and
+      // the watchdog fires getAccountInfo N times on every startup cycle.
+      if (st.lastSubmitMs === 0) continue;
       if (now - st.lastSubmitMs <= this.opts.watchdogStaleMs) continue;
       kind2WatchdogFireTotal.inc();
       const feedHex = toHex(entry.pythFeedId);

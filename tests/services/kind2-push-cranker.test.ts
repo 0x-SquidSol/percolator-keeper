@@ -301,7 +301,12 @@ describe("Kind2PushCranker — tick overlap + watchdog", () => {
     cranker.stop();
   });
 
-  it("watchdog forces getAccountInfo for stale markets", async () => {
+  it("watchdog skips never-pushed markets (cold start, no firehose)", async () => {
+    // Regression: pre-fix, getState initialised lastSubmitMs=0 and the
+    // watchdog condition `now - 0 > watchdogStaleMs` was always true, so
+    // every fresh market triggered a getAccountInfo on the first cycle.
+    // N markets on startup = N RPC fires immediately. Post-fix the
+    // never-pushed case is skipped; the regular tick handles cold-start.
     const registry = new StubRegistry();
     const cache = new AccountCache();
     const connection = {
@@ -314,9 +319,10 @@ describe("Kind2PushCranker — tick overlap + watchdog", () => {
     const cranker = makeCranker({ registry, cache, connection });
     registry.set([entryFor(SLAB_A)]);
     await cranker.runWatchdog();
-    expect(connection.getAccountInfo).toHaveBeenCalledOnce();
+    expect(connection.getAccountInfo).not.toHaveBeenCalled();
     cranker.stop();
   });
+
 });
 
 describe("parsePythPriceUpdateV2 sanity (sanity-check the test fixture builder)", () => {
