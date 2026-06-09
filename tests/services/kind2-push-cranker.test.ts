@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Keypair, PublicKey, type Connection } from "@solana/web3.js";
+import { sendCriticalAlert } from "@percolatorct/shared";
 import { Kind2PushCranker } from "../../src/services/kind2-push-cranker.js";
 import { AccountCache } from "../../src/lib/account-cache.js";
 import {
@@ -104,12 +105,25 @@ function makeCranker(opts: {
   registry: StubRegistry;
   cache: AccountCache;
   connection?: Connection;
+  // Optional overrides for tests that need to exercise P1 batching,
+  // dedup windows, failure thresholds, etc. These win over the defaults
+  // below via the trailing spread.
+  p1FailureThreshold?: number;
+  p1DedupMs?: number;
+  p1FlushDelayMs?: number;
+  p1BatchExpandLimit?: number;
 }): Kind2PushCranker {
+  const {
+    registry,
+    cache,
+    connection,
+    ...overrides
+  } = opts;
   return new Kind2PushCranker({
-    registry: opts.registry as unknown as Parameters<typeof Kind2PushCranker>[0]["registry"],
-    cache: opts.cache,
+    registry: registry as unknown as Parameters<typeof Kind2PushCranker>[0]["registry"],
+    cache,
     leader: {} as LeaderLock,
-    connection: opts.connection ?? makeConnection(),
+    connection: connection ?? makeConnection(),
     payer: Keypair.generate(),
     programId: PROGRAM_ID,
     // KeeperBudget: only `canSpend` and `recordTx` are touched by the mocked send.
@@ -119,6 +133,7 @@ function makeCranker(opts: {
     watchdogMs: 10_000,
     p1FailureThreshold: 3,
     p1DedupMs: 60_000,
+    ...overrides,
   });
 }
 
@@ -420,5 +435,133 @@ describe("parsePythPriceUpdateV2 sanity (sanity-check the test fixture builder)"
     expect(parsed!.publishTime).toBe(1_780_000_000n);
     expect(parsed!.price).toBe(12_345_678n);
     expect(parsed!.exponent).toBe(-8);
+  });
+});
+
+describe("Kind2PushCranker — P1 summary-batching", () => {
+  // Helper: register N slabs in the registry and seed cache + Pyth state
+  // so a single tick will route each one through recordFailure (via a
+  // submit reject), driving each past p1FailureThreshold = 1 in one tick.
+  function seedNFailingSlabs(
+    registry: StubRegistry,
+    cache: AccountCache,
+    n: number,
+  ): void {
+    const pythPubkey = new PublicKey(new Uint8Array(32).fill(7)).toBase58();
+    cache.set(
+      pythPubkey,
+      buildPythBytes(1_700_000_000n, 10_000_000_000_000n, -8),
+      "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ",
+      1_000,
+    );
+    const entries: Kind2Entry[] = [];
+    for (let i = 0; i < n; i++) {
+      const slabKey = new PublicKey(new Uint8Array(32).fill(0x40 + i)).toBase58();
+      entries.push(entryFor(slabKey));
+    }
+    registry.set(entries);
+  }
+
+  it("queues N concurrent P1s into one summary alert after p1FlushDelayMs", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(sendCriticalAlert).mockClear();
+      const registry = new StubRegistry();
+      const cache = new AccountCache();
+      const cranker = makeCranker({
+        registry,
+        cache,
+        // Threshold 1 so a single failure per slab is enough to fire.
+        p1FailureThreshold: 1,
+        // Disable per-slab dedup so it doesn't mask the global batching.
+        p1DedupMs: 0,
+        // Default flush delay (5s); explicit for test clarity.
+        p1FlushDelayMs: 5_000,
+        p1BatchExpandLimit: 3,
+      });
+      seedNFailingSlabs(registry, cache, 7);
+      // Reject every submit with a generic error → routes to recordFailure.
+      sendMock.mockReset();
+      sendMock.mockRejectedValue(new Error("simulated network failure"));
+      await cranker.tick();
+      // Per-slab dedup disabled + threshold 1: maybeFireP1 is called N times
+      // and N slabs are queued. The summary has NOT fired yet because the
+      // 5s flush timer is still pending.
+      expect(vi.mocked(sendCriticalAlert)).not.toHaveBeenCalled();
+      // Advance past the flush delay; ONE summary alert fires.
+      vi.advanceTimersByTime(5_001);
+      expect(vi.mocked(sendCriticalAlert)).toHaveBeenCalledTimes(1);
+      const call = vi.mocked(sendCriticalAlert).mock.calls[0]!;
+      const title = call[0];
+      const fields = call[1]!;
+      expect(title).toContain("7 slabs degraded");
+      const slabCountField = fields.find((f) => f.name === "slab_count");
+      expect(slabCountField?.value).toBe("7");
+      // Expand limit was 3 → 4 entries fold into slabs_overflow_count.
+      const overflowField = fields.find((f) => f.name === "slabs_overflow_count");
+      expect(overflowField?.value).toBe("4");
+      // First 3 slabs are expanded individually.
+      expect(fields.find((f) => f.name === "slab_0")).toBeTruthy();
+      expect(fields.find((f) => f.name === "slab_2")).toBeTruthy();
+      expect(fields.find((f) => f.name === "slab_3")).toBeUndefined();
+      cranker.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to fire-inline when p1FlushDelayMs is 0", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(sendCriticalAlert).mockClear();
+      const registry = new StubRegistry();
+      const cache = new AccountCache();
+      const cranker = makeCranker({
+        registry,
+        cache,
+        p1FailureThreshold: 1,
+        p1DedupMs: 0,
+        p1FlushDelayMs: 0,
+      });
+      seedNFailingSlabs(registry, cache, 3);
+      sendMock.mockReset();
+      sendMock.mockRejectedValue(new Error("simulated network failure"));
+      await cranker.tick();
+      // With batching disabled, each maybeFireP1 fires inline → 3 calls.
+      expect(vi.mocked(sendCriticalAlert)).toHaveBeenCalledTimes(3);
+      cranker.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stop() flushes a pending batch synchronously (no lost page on demotion)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(sendCriticalAlert).mockClear();
+      const registry = new StubRegistry();
+      const cache = new AccountCache();
+      const cranker = makeCranker({
+        registry,
+        cache,
+        p1FailureThreshold: 1,
+        p1DedupMs: 0,
+        p1FlushDelayMs: 5_000,
+      });
+      seedNFailingSlabs(registry, cache, 2);
+      sendMock.mockReset();
+      sendMock.mockRejectedValue(new Error("simulated network failure"));
+      await cranker.tick();
+      // Batch is pending; no alert fired yet.
+      expect(vi.mocked(sendCriticalAlert)).not.toHaveBeenCalled();
+      // stop() must drain the batch — leader demotion would otherwise
+      // lose the page.
+      cranker.stop();
+      expect(vi.mocked(sendCriticalAlert)).toHaveBeenCalledTimes(1);
+      const title = vi.mocked(sendCriticalAlert).mock.calls[0]![0];
+      expect(title).toContain("2 slabs degraded");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

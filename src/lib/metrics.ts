@@ -422,6 +422,25 @@ export const kind2PushTickDurationMs = new Histogram({
   registers: [registry],
 });
 
+// P1 alert summary-batching. Correlated regressions (one SDK bug × N
+// markets) can drive every market across the consecFailures threshold
+// inside a single tick; per-slab dedup alone lets N pages fan out. The
+// cranker queues qualifying P1s into a short flush window and emits one
+// summary alert per window — counter records flushes, histogram records
+// how many slabs were folded into each flush.
+export const kind2P1BatchAlertsTotal = new Counter({
+  name: "keeper_kind2_p1_batch_alerts_total",
+  help: "Number of batched P1 summary alerts emitted by the kind=2 push cranker",
+  registers: [registry],
+});
+
+export const kind2P1BatchSlabCount = new Histogram({
+  name: "keeper_kind2_p1_batch_slab_count",
+  help: "Number of distinct slabs folded into each batched P1 summary alert",
+  buckets: [1, 2, 5, 10, 25, 50, 100],
+  registers: [registry],
+});
+
 // ─── kind=2 force-close cranker ─────────────────────────────────────────
 //
 // Permissionless `ForceCloseKind2` (tag 88) cranker. Each kind=2 market has

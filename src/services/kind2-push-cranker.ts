@@ -53,6 +53,8 @@ import {
   kind2WatchdogFireTotal,
   kind2PushTickOverlapTotal,
   kind2PushTickDurationMs,
+  kind2P1BatchAlertsTotal,
+  kind2P1BatchSlabCount,
 } from "../lib/metrics.js";
 
 const logger = createLogger("keeper:kind2-push");
@@ -167,6 +169,21 @@ export interface Kind2PushCrankerOptions {
   readonly p1FailureThreshold?: number;
   /** P1 alert dedup window in ms. Default 10 minutes. */
   readonly p1DedupMs?: number;
+  /**
+   * Flush window for P1 summary-batching in ms. After per-slab dedup
+   * passes, the page is queued onto a pending batch; the batch fires
+   * as a single summary alert this many ms after the first queued
+   * entry. Bounds the worst-case N-page fan-out from a correlated
+   * regression (one SDK bug × N markets) to one alert per window.
+   * Set to 0 to disable batching and fire inline. Default 5000.
+   */
+  readonly p1FlushDelayMs?: number;
+  /**
+   * Cap on slabs expanded individually in a summary alert before the
+   * rest are folded into a single `slabs_overflow_count` field. Bounds
+   * the pager payload size on a large-fan-out incident. Default 5.
+   */
+  readonly p1BatchExpandLimit?: number;
   /** Per-tick concurrency for Promise.allSettled chunks. Default 32. */
   readonly perTickConcurrency?: number;
   /**
@@ -186,6 +203,18 @@ export class Kind2PushCranker {
   private tickTimer: NodeJS.Timeout | null = null;
   private watchdogTimer: NodeJS.Timeout | null = null;
   private tickInflight = false;
+  /**
+   * Pending P1 summary batch. Keyed by slab so a slab re-entering the
+   * batch overwrites its prior reason instead of double-counting. The
+   * flush timer is armed by the FIRST queued entry and NOT re-armed on
+   * subsequent entries, so any single queued slab's alert delay is
+   * bounded by `p1FlushDelayMs`.
+   */
+  private readonly p1Batch = new Map<
+    string,
+    { reason: string; conditionIdHex: string | undefined }
+  >();
+  private p1FlushTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: Kind2PushCrankerOptions) {
     this.opts = {
@@ -195,6 +224,8 @@ export class Kind2PushCranker {
       maxBackoffMs: 60_000,
       p1FailureThreshold: 5,
       p1DedupMs: 10 * 60_000,
+      p1FlushDelayMs: 5_000,
+      p1BatchExpandLimit: 5,
       perTickConcurrency: 32,
       ...opts,
     };
@@ -236,6 +267,55 @@ export class Kind2PushCranker {
       clearInterval(this.watchdogTimer);
       this.watchdogTimer = null;
     }
+    // Drain any pending P1 batch before yielding leadership — losing
+    // the page on demotion would defeat the whole point of batching.
+    // flushP1Batch is a synchronous no-op when the batch is empty.
+    this.flushP1Batch();
+  }
+
+  /**
+   * Drain the pending P1 batch into one summary alert. Fire-and-forget —
+   * never awaits the sendCriticalAlert promise so a stuck pager backend
+   * can't wedge stop() or the flush timer callback.
+   */
+  private flushP1Batch(): void {
+    if (this.p1FlushTimer) {
+      clearTimeout(this.p1FlushTimer);
+      this.p1FlushTimer = null;
+    }
+    if (this.p1Batch.size === 0) return;
+    const entries = [...this.p1Batch.entries()];
+    this.p1Batch.clear();
+    kind2P1BatchAlertsTotal.inc();
+    kind2P1BatchSlabCount.observe(entries.length);
+    const expand = this.opts.p1BatchExpandLimit;
+    const head = entries.slice(0, expand);
+    const overflow = entries.length - head.length;
+    // Compact one-line summary for pagers that truncate structured
+    // fields; `slab_i / reason_i` give the first few entries in full so
+    // an operator can act without grepping logs.
+    const summary = entries
+      .map(([slab, v]) => `${slab.slice(0, 8)}:${v.reason.split(" ")[0]}`)
+      .join(",")
+      .slice(0, 512);
+    const fields: Array<{ name: string; value: string }> = [
+      { name: "slab_count", value: String(entries.length) },
+      { name: "slabs_summary", value: summary },
+    ];
+    head.forEach(([slab, v], i) => {
+      fields.push({ name: `slab_${i}`, value: slab });
+      fields.push({ name: `reason_${i}`, value: v.reason.slice(0, 256) });
+      if (v.conditionIdHex) {
+        fields.push({ name: `condition_id_${i}`, value: v.conditionIdHex });
+      }
+    });
+    if (overflow > 0) {
+      fields.push({ name: "slabs_overflow_count", value: String(overflow) });
+    }
+    void sendCriticalAlert(
+      `kind2-push P1 (${entries.length} slab${entries.length === 1 ? "" : "s"} degraded)`,
+      fields,
+    )?.catch(() => {});
   }
 
   // ── Tick (test-visible) ───────────────────────────────────────────────
@@ -486,13 +566,30 @@ export class Kind2PushCranker {
 
   private maybeFireP1(slab: string, st: MarketState, reason: string, entry: Kind2Entry | undefined): void {
     const now = Date.now();
+    // Gate: per-slab dedup — one flapping market can't spam every cycle.
     if (now - st.lastP1Ms < this.opts.p1DedupMs) return;
     st.lastP1Ms = now;
-    void sendCriticalAlert("kind2-push P1", [
-      { name: "slab", value: slab },
-      { name: "reason", value: reason.slice(0, 256) },
-      ...(entry ? [{ name: "condition_id", value: toHex(entry.fields.polymarketConditionId) }] : []),
-    ])?.catch(() => {});
+    const conditionIdHex = entry ? toHex(entry.fields.polymarketConditionId) : undefined;
+    // Summary-batching: per-slab dedup above still applies — this only
+    // collapses N concurrent first-time P1s (correlated SDK regression,
+    // mass deviation-guard failure) into one summary page. Setting
+    // p1FlushDelayMs <= 0 restores the original fire-per-slab behaviour.
+    if (this.opts.p1FlushDelayMs <= 0) {
+      void sendCriticalAlert("kind2-push P1", [
+        { name: "slab", value: slab },
+        { name: "reason", value: reason.slice(0, 256) },
+        ...(conditionIdHex ? [{ name: "condition_id", value: conditionIdHex }] : []),
+      ])?.catch(() => {});
+      return;
+    }
+    // Overwrite on re-entry: most recent reason wins, timer is NOT
+    // re-armed (keeps the first queued entry's delay bounded by
+    // p1FlushDelayMs).
+    this.p1Batch.set(slab, { reason, conditionIdHex });
+    if (!this.p1FlushTimer) {
+      this.p1FlushTimer = setTimeout(() => this.flushP1Batch(), this.opts.p1FlushDelayMs);
+      this.p1FlushTimer.unref?.();
+    }
   }
 
   private getState(slab: string): MarketState {
