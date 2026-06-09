@@ -301,26 +301,113 @@ describe("Kind2PushCranker — tick overlap + watchdog", () => {
     cranker.stop();
   });
 
-  it("watchdog skips never-pushed markets (cold start, no firehose)", async () => {
-    // Regression: pre-fix, getState initialised lastSubmitMs=0 and the
-    // watchdog condition `now - 0 > watchdogStaleMs` was always true, so
-    // every fresh market triggered a getAccountInfo on the first cycle.
-    // N markets on startup = N RPC fires immediately. Post-fix the
-    // never-pushed case is skipped; the regular tick handles cold-start.
-    const registry = new StubRegistry();
-    const cache = new AccountCache();
-    const connection = {
-      getAccountInfo: vi.fn(async () => ({
-        data: buildPythBytes(1_700_000_000n, 10_000_000_000_000n, -8),
-        owner: new PublicKey("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ"),
-        lamports: 1, executable: false, rentEpoch: 0,
-      })),
-    } as unknown as Connection;
-    const cranker = makeCranker({ registry, cache, connection });
-    registry.set([entryFor(SLAB_A)]);
-    await cranker.runWatchdog();
-    expect(connection.getAccountInfo).not.toHaveBeenCalled();
-    cranker.stop();
+  it("watchdog does NOT fire on startup before watchdogStaleMs has elapsed", async () => {
+    // Regression for the startup-N-fires bug: pre-fix, getState initialised
+    // lastSubmitMs=0 and the watchdog condition `now - 0 > watchdogStaleMs`
+    // was always true, so every fresh market triggered a getAccountInfo on
+    // the first cycle. N markets on startup = N RPC fires immediately.
+    // Post-fix the watchdog gates on MAX(lastSubmitMs, firstSeenMs), so a
+    // freshly-registered market is silent until watchdogStaleMs has elapsed
+    // since registration.
+    vi.useFakeTimers();
+    try {
+      const registry = new StubRegistry();
+      const cache = new AccountCache();
+      const connection = {
+        getAccountInfo: vi.fn(async () => ({
+          data: buildPythBytes(1_700_000_000n, 10_000_000_000_000n, -8),
+          owner: new PublicKey("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ"),
+          lamports: 1, executable: false, rentEpoch: 0,
+        })),
+      } as unknown as Connection;
+      const cranker = makeCranker({ registry, cache, connection });
+      registry.set([entryFor(SLAB_A)]);
+      // Calling runWatchdog seeds state (firstSeenMs = now). Within the
+      // staleness window the watchdog must stay silent.
+      await cranker.runWatchdog();
+      expect(connection.getAccountInfo).not.toHaveBeenCalled();
+      cranker.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("watchdog fires for a never-pushed market once watchdogStaleMs elapses since registration", async () => {
+    // Regression for the cold-start blind spot: the old
+    // `lastSubmitMs === 0` skip meant a market that registered but
+    // never-pushed-successfully (e.g. Pyth cache miss persisted past the
+    // staleness window) would never get the RPC fallback. Post-fix the
+    // firstSeenMs sentinel kicks in once watchdogStaleMs has elapsed.
+    vi.useFakeTimers();
+    try {
+      const registry = new StubRegistry();
+      const cache = new AccountCache();
+      const connection = {
+        getAccountInfo: vi.fn(async () => ({
+          data: buildPythBytes(1_700_000_000n, 10_000_000_000_000n, -8),
+          owner: new PublicKey("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ"),
+          lamports: 1, executable: false, rentEpoch: 0,
+        })),
+      } as unknown as Connection;
+      const cranker = makeCranker({ registry, cache, connection });
+      registry.set([entryFor(SLAB_A)]);
+      // First call seeds firstSeenMs = now at fake-time t0; no cache entry
+      // means no tick success path runs, lastSubmitMs stays 0.
+      await cranker.runWatchdog();
+      expect(connection.getAccountInfo).not.toHaveBeenCalled();
+      // Advance past the default 60s staleness window.
+      vi.advanceTimersByTime(60_001);
+      await cranker.runWatchdog();
+      expect(connection.getAccountInfo).toHaveBeenCalledOnce();
+      cranker.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("watchdog fires for a previously-pushed market that has gone stale", async () => {
+    // Lock in that the original "was pushing then stalled" failsafe still
+    // works. Drives one real successful tick (sets lastSubmitMs via the
+    // production success path), advances fake time past watchdogStaleMs,
+    // then asserts the RPC fallback fires.
+    vi.useFakeTimers();
+    try {
+      const registry = new StubRegistry();
+      const cache = new AccountCache();
+      const connection = {
+        getAccountInfo: vi.fn(async () => ({
+          data: buildPythBytes(1_700_000_001n, 10_000_000_000_000n, -8),
+          owner: new PublicKey("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ"),
+          lamports: 1, executable: false, rentEpoch: 0,
+        })),
+      } as unknown as Connection;
+      const cranker = makeCranker({ registry, cache, connection });
+      const entry = entryFor(SLAB_A);
+      const pythPubkey = new PublicKey(new Uint8Array(32).fill(7)).toBase58();
+      cache.set(
+        pythPubkey,
+        buildPythBytes(1_700_000_000n, 10_000_000_000_000n, -8),
+        "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ",
+        1_000,
+      );
+      registry.set([entry]);
+      sendMock.mockReset();
+      sendMock.mockResolvedValue({ signature: "sig", estimatedCost: 5_000, simulatedCu: 30_000 });
+      // Successful tick stamps lastSubmitMs = Date.now() via the real path.
+      await cranker.tick();
+      expect(sendMock).toHaveBeenCalledOnce();
+      // Within the staleness window: watchdog still silent.
+      vi.advanceTimersByTime(30_000);
+      await cranker.runWatchdog();
+      expect(connection.getAccountInfo).not.toHaveBeenCalled();
+      // Past the staleness window: watchdog fires the RPC fallback.
+      vi.advanceTimersByTime(31_000);
+      await cranker.runWatchdog();
+      expect(connection.getAccountInfo).toHaveBeenCalledOnce();
+      cranker.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
 });

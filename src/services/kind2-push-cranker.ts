@@ -120,6 +120,14 @@ interface MarketState {
   lastSubmittedPublishTime: bigint;
   /** Wall-clock ms of the most recent successful submit; drives the watchdog. */
   lastSubmitMs: number;
+  /**
+   * Wall-clock ms when getState first created this entry. Sentinel used by
+   * the watchdog so a cold-start market that never-pushes-successfully
+   * still gets RPC fallback after watchdogStaleMs elapses from its first
+   * registration — without this, lastSubmitMs=0 would either fire on every
+   * cycle (no gate) or never fire (gated on lastSubmitMs!==0).
+   */
+  firstSeenMs: number;
   /** Consecutive failures (Pyth read or submit) — drives the P1 cooldown. */
   consecFailures: number;
   /** Wall-clock ms after which the next attempt is permitted (exponential backoff). */
@@ -368,13 +376,16 @@ export class Kind2PushCranker {
     for (const entry of entries) {
       const st = this.getState(entry.slab);
       if (st.inflight) continue;
-      // Never-pushed markets are the regular tick's responsibility; the
-      // watchdog is a latent failsafe for "was pushing then stalled", not
-      // a cold-start primer. Without this guard, getState's lastSubmitMs=0
-      // makes `now - 0 > watchdogStaleMs` true for every fresh market and
-      // the watchdog fires getAccountInfo N times on every startup cycle.
-      if (st.lastSubmitMs === 0) continue;
-      if (now - st.lastSubmitMs <= this.opts.watchdogStaleMs) continue;
+      // Gate against MAX(lastSubmitMs, firstSeenMs) so the watchdog covers
+      // BOTH "was pushing then stalled" (lastSubmitMs dominates) AND "never
+      // pushed since registration" (firstSeenMs dominates). The naive
+      // `lastSubmitMs === 0` skip was a bug: a market that never-pushes-
+      // successfully (e.g. LaserStream stalls before the first tick lands)
+      // would never get RPC fallback. Using firstSeenMs as a sentinel also
+      // avoids the original startup-N-fires regression because the watchdog
+      // only fires once `watchdogStaleMs` has elapsed since registration.
+      const lastActivityMs = Math.max(st.lastSubmitMs, st.firstSeenMs);
+      if (now - lastActivityMs <= this.opts.watchdogStaleMs) continue;
       kind2WatchdogFireTotal.inc();
       const feedHex = toHex(entry.pythFeedId);
       let pythPubkey: PublicKey;
@@ -490,6 +501,7 @@ export class Kind2PushCranker {
       st = {
         lastSubmittedPublishTime: 0n,
         lastSubmitMs: 0,
+        firstSeenMs: Date.now(),
         consecFailures: 0,
         nextEligibleMs: 0,
         lastP1Ms: 0,
