@@ -332,6 +332,64 @@ describe("Kind2Registry — reconcile vs stream race", () => {
     expect(registry.size()).toBe(1);
     expect(registry.get(SLAB_A.toBase58())).toBeTruthy();
   });
+
+  it("coalesces concurrent reconcileNow() callers onto a single RPC scan", async () => {
+    // Without coalescing, ops calling reconcileNow() while the periodic
+    // timer is mid-scan kicks off a second getProgramAccounts and a
+    // parallel diff pass — double-counting metrics and re-introducing
+    // the stream-vs-reconcile race in a new shape. With the inflight
+    // promise gate, both callers await the same scan.
+    const loader = new FakeLoader();
+    let callCount = 0;
+    let resolveRpc: () => void = () => {};
+    const rpcReady = new Promise<void>((r) => { resolveRpc = r; });
+    const conn = {
+      getProgramAccounts: vi.fn(async () => {
+        callCount++;
+        if (callCount === 1) return []; // seed
+        await rpcReady;
+        return [];
+      }),
+    } as unknown as Connection;
+
+    const registry = new Kind2Registry({
+      programIds: [PROGRAM_ID],
+      connection: conn,
+      reconcileMs: 0,
+    });
+    await registry.seedAndAttach(loader.asLoader());
+    const callsAfterSeed = callCount;
+
+    // Three reconciles in rapid succession; the first gates on rpcReady,
+    // the next two must coalesce onto the same in-flight promise.
+    const p1 = registry.reconcileNow();
+    const p2 = registry.reconcileNow();
+    const p3 = registry.reconcileNow();
+    await Promise.resolve();
+
+    // Only ONE additional getProgramAccounts has fired despite three calls.
+    expect(callCount - callsAfterSeed).toBe(1);
+
+    resolveRpc();
+    await Promise.all([p1, p2, p3]);
+
+    // Still only one — the coalesced callers all resolved off the same scan.
+    expect(callCount - callsAfterSeed).toBe(1);
+
+    // After the in-flight clears, a fresh reconcile must launch a new scan.
+    let resolveRpc2: () => void = () => {};
+    const rpcReady2 = new Promise<void>((r) => { resolveRpc2 = r; });
+    (conn.getProgramAccounts as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      callCount++;
+      await rpcReady2;
+      return [];
+    });
+    const p4 = registry.reconcileNow();
+    await Promise.resolve();
+    expect(callCount - callsAfterSeed).toBe(2);
+    resolveRpc2();
+    await p4;
+  });
 });
 
 describe("Kind2Registry — full-slab decoder slice", () => {

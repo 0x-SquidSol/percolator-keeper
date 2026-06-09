@@ -116,6 +116,13 @@ export class Kind2Registry {
   private reconcileTimer: NodeJS.Timeout | null = null;
   private seeded = false;
   private leaderRunning = false;
+  /**
+   * In-flight reconcile promise. Coalesces concurrent callers
+   * (ops `reconcileNow()` + the periodic leader timer) onto a single
+   * RPC scan so the two callers can't race-mutate the diff map. Mirrors
+   * the `BlockhashCache._fetchPromise` pattern used elsewhere in lib/.
+   */
+  private inflightReconcile: Promise<void> | null = null;
 
   constructor(opts: Kind2RegistryOptions) {
     this.opts = { reconcileMs: DEFAULT_RECONCILE_MS, ...opts };
@@ -280,7 +287,21 @@ export class Kind2Registry {
    * missing-from-memory entries, evicts any missing-from-chain entries,
    * and flags content drift. Diff counts are emitted as a P1 metric.
    */
-  private async reconcileWithRpc(): Promise<void> {
+  private reconcileWithRpc(): Promise<void> {
+    // Single-flight: if a reconcile is already running, every caller
+    // (ops `reconcileNow()` + the periodic leader timer) awaits the
+    // same promise. Two concurrent reconciles would each compute their
+    // own `scanStartEntries` snapshot and racingly evict/upsert,
+    // producing spurious diff metrics and re-introducing the
+    // stream-vs-reconcile oscillation the snapshot pattern prevents.
+    if (this.inflightReconcile) return this.inflightReconcile;
+    this.inflightReconcile = this.doReconcile().finally(() => {
+      this.inflightReconcile = null;
+    });
+    return this.inflightReconcile;
+  }
+
+  private async doReconcile(): Promise<void> {
     const t0 = Date.now();
     // Snapshot the registry's view at scan-start. The stream can upsert
     // new entries while getProgramAccounts is in flight; without the
