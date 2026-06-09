@@ -557,13 +557,20 @@ export class CrankService {
   }
 
   /**
-   * True HYPERP mode: oracle_authority == [0;32] AND index_feed_id == [0;32].
-   * Uses toBytes() check — compatible with both real PublicKey and test mocks.
+   * HYPERP mode iff index_feed_id == [0;32], matching the program's
+   * `oracle::is_hyperp_mode` (percolator.rs:4156-4158), which keys ONLY off
+   * index_feed_id. The old extra `oracle_authority == 0` condition was a stale
+   * pre-Phase-G "admin oracle" artifact: post-Phase-G that field is
+   * `hyperp_authority` and is intentionally bootstrapped non-zero on HYPERP
+   * markets (UpdateAuthority HYPERP_MARK), yet `UpdateHyperpMark` is gated only
+   * on is_hyperp_mode and has no authority check — so requiring authority==0
+   * here misclassified bootstrapped HYPERP markets as non-hyperp and silently
+   * stopped refreshing their DEX-EMA mark.
+   * Uses toBytes() — compatible with both real PublicKey and test mocks.
    */
   private isHyperpOracle(market: DiscoveredMarket): boolean {
     const feedBytes = market.config.indexFeedId.toBytes();
-    const isZeroFeed = feedBytes.every((b: number) => b === 0);
-    return !this.isAdminOracle(market) && isZeroFeed;
+    return feedBytes.every((b: number) => b === 0);
   }
 
   private async resolveHyperpPoolRemainingAccounts(
@@ -989,34 +996,13 @@ export class CrankService {
       txSentTotal.inc({ result: "drop", type: "crank" });
       continue;
     }
-    // GH#1251: Live authority check — covers both the steady-state case (flag already set)
-    // and the post-discover() window where the flag was just reset.
-    // Any admin-oracle market where the keeper is NOT the oracle authority is always skipped.
-    if (
-      this.isAdminOracle(state.market) &&
-      !keeperKey.equals(state.market.config.oracleAuthority)
-    ) {
-      // Keep the flag in sync so crankMarket() also fast-paths correctly.
-      if (!state.foreignOracleSkipped) {
-        state.foreignOracleSkipped = true;
-        // GH#1748: Use WARN (not debug) on first detection, include both keys so ops can
-        // immediately diagnose a CRANK_KEYPAIR mismatch without reading the source.
-        logger.warn("crankAll: admin-oracle market skipped — keeper is NOT the oracle authority (key mismatch). " +
-          "Fix: set CRANK_KEYPAIR to the oracle authority key, or update the on-chain oracle authority.", {
-          slabAddress,
-          marketOracleAuthority: state.market.config.oracleAuthority.toBase58(),
-          keeperPublicKey: keeperKey.toBase58(),
-        });
-      } else {
-        logger.debug("crankAll: re-skipping foreign oracle market (flag was reset by discover)", {
-          slabAddress,
-          marketOracleAuthority: state.market.config.oracleAuthority.toBase58(),
-          keeperPublicKey: keeperKey.toBase58(),
-        });
-      }
-      skippedForeignOracle++;
-      continue;
-    }
+    // Post-Phase-G: the "foreign oracle" skip (admin-push oracle requiring the
+    // keeper to be the oracle authority) was removed. The program no longer has
+    // an admin-push oracle; `oracle_authority` is now `hyperp_authority`, which
+    // does NOT gate cranking — KeeperCrank/UpdateHyperpMark are permissionless.
+    // Skipping markets whose keeper != hyperp_authority false-skipped crankable
+    // markets, so the check is gone. (skippedForeignOracle stays 0.)
+
     // PERC-1254: Live Hyperp-no-price check.
     // Condition: admin-oracle market where keeper IS the authority, indexFeedId=all-zeros
     // (Hyperp mode), and on-chain authority_price_e6 is still 0.  Sending KeeperCrank in
