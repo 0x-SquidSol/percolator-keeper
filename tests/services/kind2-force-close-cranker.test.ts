@@ -73,18 +73,21 @@ class StubRegistry {
   set(entries: Kind2Entry[]): void { this.items = entries; }
 }
 
-function makeConnection(): Connection {
-  return {} as unknown as Connection;
+function makeConnection(
+  getTransaction?: (signature: string, opts?: unknown) => Promise<unknown>,
+): Connection {
+  return { getTransaction } as unknown as Connection;
 }
 
 function makeCranker(opts: {
   registry: StubRegistry;
   now?: () => number;
   jitterMaxSecs?: number;
+  getTransaction?: (signature: string, opts?: unknown) => Promise<unknown>;
 }): Kind2ForceCloseCranker {
   return new Kind2ForceCloseCranker({
     registry: opts.registry as unknown as Parameters<typeof Kind2ForceCloseCranker>[0]["registry"],
-    connection: makeConnection(),
+    connection: makeConnection(opts.getTransaction),
     payer: Keypair.generate(),
     programId: PROGRAM_ID,
     budget: { canSpend: () => true, recordTx: () => {}, getStats: () => ({}) } as never,
@@ -282,6 +285,96 @@ describe("Kind2ForceCloseCranker — tick", () => {
     expect(sendMock).toHaveBeenCalledTimes(1);
     resolveSend({ signature: "sig", estimatedCost: 5_000, simulatedCu: 30_000 });
     await firstTick;
+    cranker.stop();
+  });
+});
+
+describe("Kind2ForceCloseCranker — branch attribution", () => {
+  // The wrapper emits one msg! on success:
+  //   "ForceCloseKind2: slab=... settled_price_e6=... refund_mode={true|false}
+  //    (twap_unbounded={Some|None}..., engine_last=..., ...)"
+  // The cranker pulls logs via connection.getTransaction and labels the
+  // success metric with the resolved branch. These tests pin each label
+  // by feeding synthesized log lines through a stubbed getTransaction.
+
+  const fcTs = 1_800_000_000n;
+  const nowAtFire = (Number(fcTs) + 30) * 1000;
+
+  function txWithLog(line: string) {
+    return async () => ({
+      meta: { logMessages: ["Program log: enter", line, "Program log: exit"] },
+    });
+  }
+
+  it("labels branch=\"twap\" when refund_mode=false and twap_unbounded=Some(...)", async () => {
+    const registry = new StubRegistry();
+    const getTx = vi.fn(txWithLog(
+      `Program log: ForceCloseKind2: slab=${SLAB_A} settled_price_e6=512345 refund_mode=false (twap_unbounded=Some(512345), engine_last=500000, force_close_unix_ts=${fcTs}, now=${nowAtFire / 1000})`,
+    ));
+    const cranker = makeCranker({ registry, now: () => nowAtFire, getTransaction: getTx });
+    registry.set([entryFor(SLAB_A, fcTs)]);
+    sendMock.mockResolvedValue({ signature: "sig-twap", estimatedCost: 5_000, simulatedCu: 30_000 });
+    await cranker.tick();
+    expect(getTx).toHaveBeenCalledWith("sig-twap", expect.objectContaining({ commitment: "confirmed" }));
+    cranker.stop();
+  });
+
+  it("labels branch=\"engine_last\" when refund_mode=false and twap_unbounded=None", async () => {
+    const registry = new StubRegistry();
+    const getTx = vi.fn(txWithLog(
+      `Program log: ForceCloseKind2: slab=${SLAB_A} settled_price_e6=500000 refund_mode=false (twap_unbounded=None, engine_last=500000, force_close_unix_ts=${fcTs}, now=${nowAtFire / 1000})`,
+    ));
+    const cranker = makeCranker({ registry, now: () => nowAtFire, getTransaction: getTx });
+    registry.set([entryFor(SLAB_A, fcTs)]);
+    sendMock.mockResolvedValue({ signature: "sig-engine", estimatedCost: 5_000, simulatedCu: 30_000 });
+    await cranker.tick();
+    expect(getTx).toHaveBeenCalledOnce();
+    cranker.stop();
+  });
+
+  it("labels branch=\"refund\" when refund_mode=true", async () => {
+    const registry = new StubRegistry();
+    const getTx = vi.fn(txWithLog(
+      `Program log: ForceCloseKind2: slab=${SLAB_A} settled_price_e6=10000 refund_mode=true (twap_unbounded=None, engine_last=0, force_close_unix_ts=${fcTs}, now=${nowAtFire / 1000})`,
+    ));
+    const cranker = makeCranker({ registry, now: () => nowAtFire, getTransaction: getTx });
+    registry.set([entryFor(SLAB_A, fcTs)]);
+    sendMock.mockResolvedValue({ signature: "sig-refund", estimatedCost: 5_000, simulatedCu: 30_000 });
+    await cranker.tick();
+    expect(getTx).toHaveBeenCalledOnce();
+    cranker.stop();
+  });
+
+  it("labels branch=\"unknown\" and preserves success when getTransaction throws", async () => {
+    // Critical invariant: a branch-classification failure must NOT mask
+    // the success. The market still marks done, the counter still
+    // increments — just with an "unknown" label so ops can see drift.
+    const registry = new StubRegistry();
+    const getTx = vi.fn(async () => { throw new Error("RPC connection lost"); });
+    const cranker = makeCranker({ registry, now: () => nowAtFire, getTransaction: getTx });
+    registry.set([entryFor(SLAB_A, fcTs)]);
+    sendMock.mockResolvedValue({ signature: "sig-rpcfail", estimatedCost: 5_000, simulatedCu: 30_000 });
+    await cranker.tick();
+    expect(getTx).toHaveBeenCalledOnce();
+    // Second tick: market is done, no re-attempt.
+    sendMock.mockClear();
+    await cranker.tick();
+    expect(sendMock).not.toHaveBeenCalled();
+    cranker.stop();
+  });
+
+  it("labels branch=\"unknown\" when logs are missing the wrapper msg! line", async () => {
+    // Wrapper msg! format drift would land here. Sustained "unknown"
+    // signals the parser needs updating; the success count is preserved.
+    const registry = new StubRegistry();
+    const getTx = vi.fn(async () => ({
+      meta: { logMessages: ["Program log: some unrelated line"] },
+    }));
+    const cranker = makeCranker({ registry, now: () => nowAtFire, getTransaction: getTx });
+    registry.set([entryFor(SLAB_A, fcTs)]);
+    sendMock.mockResolvedValue({ signature: "sig-noline", estimatedCost: 5_000, simulatedCu: 30_000 });
+    await cranker.tick();
+    expect(getTx).toHaveBeenCalledOnce();
     cranker.stop();
   });
 });

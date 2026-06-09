@@ -462,9 +462,24 @@ export const kind2ForceCloseAttemptTotal = new Counter({
   registers: [registry],
 });
 
+// `branch` reflects which of the three settlement paths the wrapper took
+// (see msg! "ForceCloseKind2: ... refund_mode={} twap_unbounded={:?} ..." in
+// the on-chain handler):
+//   * "twap"        — refund_mode=false AND twap_unbounded=Some(...)
+//   * "engine_last" — refund_mode=false AND twap_unbounded=None (silent
+//                     fallback after the force-close two-gate TWAP fix —
+//                     alert-worthy as it means the gate refused the live ring)
+//   * "refund"      — refund_mode=true (ring empty, full-refund settle)
+//   * "unknown"     — log parsing failed (RPC blip, missing tx, regex miss).
+//                     The success count is preserved; sustained "unknown"
+//                     means our parser drifted from the wrapper msg! format.
+//
+// Existing `sum(rate(...))` dashboard panels remain valid because sum()
+// aggregates across all labels.
 export const kind2ForceCloseSuccessTotal = new Counter({
   name: "keeper_kind2_force_close_success_total",
-  help: "ForceCloseKind2 submissions that confirmed (we won the race)",
+  help: "ForceCloseKind2 submissions that confirmed, partitioned by settlement branch (twap / engine_last / refund / unknown)",
+  labelNames: ["branch"] as const,
   registers: [registry],
 });
 

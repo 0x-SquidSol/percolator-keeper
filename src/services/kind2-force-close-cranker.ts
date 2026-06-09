@@ -252,8 +252,16 @@ export class Kind2ForceCloseCranker {
       st.done = true;
       st.consecFailures = 0;
       st.nextEligibleMs = 0;
-      kind2ForceCloseSuccessTotal.inc();
-      logger.info("kind2 force-close fired", { slab, signature: result.signature });
+      // Pull tx logs to attribute the settlement branch. The wrapper
+      // emits one "ForceCloseKind2: ... refund_mode=... twap_unbounded=..."
+      // line on success; we parse the two relevant fields. Failures here
+      // (RPC blip, missing tx, regex miss) MUST NOT mask the success — the
+      // helper is internally try/catch'd and returns "unknown" so the
+      // counter never under-reports, and the success state is already
+      // committed above before the await.
+      const branch = await this.classifySuccessBranch(result.signature);
+      kind2ForceCloseSuccessTotal.inc({ branch });
+      logger.info("kind2 force-close fired", { slab, signature: result.signature, branch });
     } catch (err) {
       this.handleSubmitError(slab, st, err);
     } finally {
@@ -262,6 +270,51 @@ export class Kind2ForceCloseCranker {
   }
 
   // ── Internal ──────────────────────────────────────────────────────────
+
+  /**
+   * Pull program logs for the confirmed force-close tx and classify which
+   * of the three wrapper settlement paths fired. Wrapper msg! on success:
+   *
+   *   "ForceCloseKind2: slab={} settled_price_e6={} refund_mode={} \
+   *    (twap_unbounded={:?}, engine_last={}, force_close_unix_ts={}, now={})"
+   *
+   * Branch detection:
+   *   * refund_mode=true                                 → "refund"
+   *   * refund_mode=false AND twap_unbounded=Some(...)   → "twap"
+   *   * refund_mode=false AND twap_unbounded=None        → "engine_last"
+   *
+   * "engine_last" is the silent-degradation case after the force-close
+   * two-gate TWAP fix — operators need to know when a market quietly fell
+   * through to engine_last instead of settling at TWAP.
+   *
+   * Any failure path here returns "unknown" so the success count is
+   * preserved. Sustained "unknown" indicates the wrapper msg! format
+   * drifted from this parser — fix the regex.
+   */
+  private async classifySuccessBranch(
+    signature: string,
+  ): Promise<"twap" | "engine_last" | "refund" | "unknown"> {
+    try {
+      const tx = await this.opts.connection.getTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: "confirmed",
+      });
+      const logs = tx?.meta?.logMessages ?? [];
+      const line = logs.find((l) => l.includes("ForceCloseKind2: slab="));
+      if (!line) return "unknown";
+      const refundMatch = /refund_mode=(true|false)/.exec(line);
+      const twapMatch = /twap_unbounded=(Some|None)/.exec(line);
+      if (!refundMatch || !twapMatch) return "unknown";
+      if (refundMatch[1] === "true") return "refund";
+      return twapMatch[1] === "Some" ? "twap" : "engine_last";
+    } catch (err) {
+      logger.warn("kind2 force-close: branch classification failed", {
+        signature,
+        err: String(err),
+      });
+      return "unknown";
+    }
+  }
 
   private buildIx(slab: string): TransactionInstruction {
     const data = encodeForceCloseKind2();
