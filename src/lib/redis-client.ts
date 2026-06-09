@@ -4,6 +4,12 @@ export interface RedisLike {
   set(key: string, value: string, opts: { ex: number; nx?: true } | { ex: number; xx?: true }): Promise<"OK" | null>;
   get(key: string): Promise<string | null>;
   del(...keys: string[]): Promise<number>;
+  /**
+   * Atomic server-side Lua script. Mirrors `@upstash/redis` `Redis.eval(script, keys, args)`.
+   * Used by the leader lock for compare-and-set renew/release so a stale node can
+   * never overwrite or delete a lock another node owns.
+   */
+  eval<T = unknown>(script: string, keys: string[], args: (string | number)[]): Promise<T>;
 }
 
 let _client: RedisLike | null | undefined = undefined;

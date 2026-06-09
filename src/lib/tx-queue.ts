@@ -168,6 +168,19 @@ export class TxQueue {
     }
   }
 
+  /**
+   * Drop all queued-but-not-yet-started tasks across every lane. Used on
+   * involuntary HA demotion so a node that just lost leadership does not run a
+   * backlog of doomed sends. Tasks already in flight are not recalled — the
+   * single-writer guard in keeperSend() blocks those at send time.
+   */
+  clearPending(): void {
+    for (const lane of ALL_LANES) {
+      this._lanes[lane].clear();
+      txQueuePending.set({ lane }, 0);
+    }
+  }
+
   getStats(): Record<TxLane, TxLaneStats> {
     const result = {} as Record<TxLane, TxLaneStats>;
     for (const lane of ALL_LANES) {

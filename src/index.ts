@@ -19,6 +19,7 @@ import { LeaderLock, makeIdentity } from "./lib/leader.js";
 import { captureAndExit } from "./lib/exit-handlers.js";
 import { StartupTracker } from "./lib/startup-tracker.js";
 import { sharedTxQueue, DRAIN_TIMEOUT_MS } from "./lib/tx-queue.js";
+import { setLeaderCheck } from "./lib/keeper-send.js";
 import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harness.js";
 import { sharedDecisionLog } from "./lib/decision-log.js";
 
@@ -82,6 +83,10 @@ const leaderLock: LeaderLock | null =
 if (haEnabled && redisClient === null) {
   logger.warn("HA_ENABLED=true but KEEPER_REDIS_URL is unset — running as standalone leader");
 }
+
+// Single-writer guard for keeperSend: only land on-chain txs while we hold
+// leadership. Reads the live LeaderLock role (standalone / no-HA → always leader).
+setLeaderCheck(() => (leaderLock ? leaderLock.role() === "leader" : true));
 
 // A5: gate /health on real readiness — Railway otherwise marks the container
 // healthy the moment the HTTP server binds, well before start() finishes
@@ -681,6 +686,10 @@ async function start() {
       },
       onDemote: (reason) => {
         logger.warn("HA: demoted from leader — stopping services", { network, reason });
+        // role() is already "standby" here (LeaderLock flips it before onDemote),
+        // so the keeperSend single-writer guard is closed. Also drop any queued
+        // sends so this node runs no backlog after losing leadership.
+        sharedTxQueue.clearPending();
         stopAllServices();
       },
     });

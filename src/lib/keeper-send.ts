@@ -11,6 +11,16 @@ import { sharedDecisionLog } from "./decision-log.js";
 
 const logger = createLogger("keeper:send");
 
+// Single-writer guard. In HA mode the keeper must only land on-chain txs while it
+// holds leadership; the on-chain programs are permissionless, so this host-local
+// gate is the actual barrier against a demoted node double-sending. Wired from
+// index.ts to read the live LeaderLock role. Defaults to always-leader so the
+// standalone (no-HA) path is unchanged.
+let _isLeader: () => boolean = () => true;
+export function setLeaderCheck(fn: () => boolean): void {
+  _isLeader = fn;
+}
+
 export const BASE_FEE_LAMPORTS = 5_000;
 
 const TIER_MAP: Record<TxType, PriorityFeeTier> = {
@@ -111,6 +121,15 @@ export async function keeperSend(
   maxRetries = 3,
   keeperOpts?: KeeperSendOptions,
 ): Promise<KeeperSendResult | null> {
+  // Single-writer guard (checked first, before any RPC). A node that lost
+  // leadership — including a task dequeued from sharedTxQueue after demotion —
+  // must not land a tx. Returns null, reusing the budget-exhausted "skip, not a
+  // failure" contract every caller already handles.
+  if (!_isLeader()) {
+    logger.warn("Single-writer guard: refusing send — node is not leader", { txType });
+    return null;
+  }
+
   const { estimatedCost, simulatedCu } = await estimateCost(connection, instructions, signers, txType);
 
   if (!budget.canSpend(estimatedCost, txType)) {

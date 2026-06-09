@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { LeaderLock } from "../../src/lib/leader.js";
+import { LeaderLock, RENEW_SCRIPT, RELEASE_SCRIPT } from "../../src/lib/leader.js";
 import type { RedisLike } from "../../src/lib/redis-client.js";
 
 // ─── Mock Redis ───────────────────────────────────────────────────────────────
@@ -9,11 +9,11 @@ type SetOpts = { ex: number; nx?: true } | { ex: number; xx?: true };
 function makeMockRedis(): {
   redis: RedisLike;
   store: Map<string, string>;
-  calls: { set: number; get: number; del: number };
+  calls: { set: number; get: number; del: number; eval: number };
   failNext: { set?: boolean; get?: boolean };
 } {
   const store = new Map<string, string>();
-  const calls = { set: 0, get: 0, del: 0 };
+  const calls = { set: 0, get: 0, del: 0, eval: 0 };
   const failNext = { set: false, get: false };
 
   const redis: RedisLike = {
@@ -39,6 +39,17 @@ function makeMockRedis(): {
         if (store.delete(k)) count++;
       }
       return count;
+    },
+    // Faithful CAS emulation of the two scripts the lock ships (matched by the
+    // exact exported strings, so the fake can't silently diverge from prod).
+    async eval<T = unknown>(script: string, keys: string[], args: (string | number)[]): Promise<T> {
+      calls.eval++;
+      const key = keys[0];
+      const identity = String(args[0]);
+      const owns = store.get(key) === identity;
+      if (script === RENEW_SCRIPT) return (owns ? 1 : 0) as T;           // TTL refresh is a no-op in the fake
+      if (script === RELEASE_SCRIPT) { if (owns) store.delete(key); return (owns ? 1 : 0) as T; }
+      throw new Error(`unexpected script in fake: ${script}`);
     },
   };
 
@@ -121,7 +132,7 @@ describe("LeaderLock state machine", () => {
     await lock.stop();
   });
 
-  it("leader renews lock on schedule", async () => {
+  it("leader renews lock on schedule (via CAS eval, not SET)", async () => {
     const { redis, calls } = makeMockRedis();
     const lock = new LeaderLock(redis, "test-id", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
     const onPromote = vi.fn();
@@ -130,29 +141,28 @@ describe("LeaderLock state machine", () => {
     lock.start({ network: "devnet", onPromote, onDemote });
     await vi.advanceTimersByTimeAsync(100);
 
+    const evalCountAfterPromote = calls.eval; // 0 — acquire uses SET NX, not eval
     const setCountAfterPromote = calls.set;
     expect(lock.role()).toBe("leader");
 
     await vi.advanceTimersByTimeAsync(10_100);
-    expect(calls.set).toBeGreaterThan(setCountAfterPromote);
+    expect(calls.eval).toBeGreaterThan(evalCountAfterPromote); // renew is a CAS eval
+    expect(calls.set).toBe(setCountAfterPromote);              // renew never re-SETs the value
     expect(lock.role()).toBe("leader");
 
     await lock.stop();
   });
 
   it("demotes after two consecutive renew failures", async () => {
-    let setCallCount = 0;
     const mockRedis: RedisLike = {
       async set(_key: string, _value: string, opts: SetOpts): Promise<"OK" | null> {
-        setCallCount++;
         const hasNx = "nx" in opts && opts.nx === true;
-        if (setCallCount === 1 && hasNx) {
-          return "OK";
-        }
-        throw new Error("Redis connection refused");
+        return hasNx ? "OK" : null; // acquire succeeds
       },
       async get(_key: string): Promise<string | null> { return null; },
       async del(..._keys: string[]): Promise<number> { return 0; },
+      // renew/release fail with a transport error (ambiguous → 2-strike demote)
+      async eval<T = unknown>(): Promise<T> { throw new Error("Redis connection refused"); },
     };
 
     const lock = new LeaderLock(mockRedis, "test-id", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
@@ -208,7 +218,7 @@ describe("LeaderLock state machine", () => {
     await lock.stop();
   });
 
-  it("stop() releases lock and DELs the key when leader", async () => {
+  it("stop() releases the key (via CAS) when leader", async () => {
     const { redis, store } = makeMockRedis();
     const lock = new LeaderLock(redis, "test-id", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
     const onPromote = vi.fn();
@@ -240,17 +250,16 @@ describe("LeaderLock state machine", () => {
     expect(calls.del).toBe(0);
   });
 
-  it("demotes when renew returns null (lock stolen)", async () => {
-    let setCallCount = 0;
+  it("demotes immediately when renew CAS reports not-owner (lock stolen)", async () => {
     const mockRedis: RedisLike = {
       async get(_key: string): Promise<string | null> { return null; },
       async del(..._keys: string[]): Promise<number> { return 0; },
       async set(_key: string, _value: string, opts: SetOpts): Promise<"OK" | null> {
-        setCallCount++;
         const hasNx = "nx" in opts && opts.nx === true;
-        if (setCallCount === 1 && hasNx) return "OK";
-        return null;
+        return hasNx ? "OK" : null; // acquire succeeds
       },
+      // CAS renew returns 0 = "not the owner" → definitive loss, demote at once.
+      async eval<T = unknown>(): Promise<T> { return 0 as T; },
     };
 
     const lock = new LeaderLock(mockRedis, "test-id", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
@@ -278,18 +287,23 @@ describe("LeaderLock state machine", () => {
     await lock.stop();
   });
 
-  it("uses XX flag on renewal (not NX)", async () => {
-    const setCalls: Array<SetOpts> = [];
+  it("renews via the CAS eval script (never a blind SET XX)", async () => {
+    const setOpts: Array<SetOpts> = [];
+    const evalScripts: string[] = [];
+    const store = new Map<string, string>();
     const mockRedis: RedisLike = {
-      async get(_key: string): Promise<string | null> { return null; },
+      async get(key: string): Promise<string | null> { return store.get(key) ?? null; },
       async del(..._keys: string[]): Promise<number> { return 0; },
-      async set(_key: string, _value: string, opts: SetOpts): Promise<"OK" | null> {
-        setCalls.push(opts);
+      async set(key: string, value: string, opts: SetOpts): Promise<"OK" | null> {
+        setOpts.push(opts);
         const hasNx = "nx" in opts && opts.nx === true;
-        const hasXx = "xx" in opts && (opts as { xx?: true }).xx === true;
-        if (setCalls.length === 1 && hasNx) return "OK";
-        if (hasXx) return "OK";
-        return null;
+        if (hasNx && store.has(key)) return null;
+        store.set(key, value);
+        return "OK";
+      },
+      async eval<T = unknown>(script: string, keys: string[], args: (string | number)[]): Promise<T> {
+        evalScripts.push(script);
+        return (store.get(keys[0]) === String(args[0]) ? 1 : 0) as T;
       },
     };
 
@@ -298,12 +312,37 @@ describe("LeaderLock state machine", () => {
     await vi.advanceTimersByTimeAsync(100);
     await vi.advanceTimersByTimeAsync(10_100);
 
-    const renewOpts = setCalls[1];
-    expect(renewOpts).toBeDefined();
-    expect("xx" in renewOpts!).toBe(true);
-    expect(!("nx" in renewOpts!) || (renewOpts as { nx?: true }).nx !== true).toBe(true);
+    // Acquire used SET NX exactly once; renew used the CAS eval, never an XX SET.
+    expect(evalScripts).toContain(RENEW_SCRIPT);
+    expect(setOpts.every((o) => !("xx" in o))).toBe(true);
 
     await lock.stop();
+  });
+
+  it("demotes when the renew Redis call hangs past renewTimeoutMs (liveness)", async () => {
+    const mockRedis: RedisLike = {
+      async get(): Promise<string | null> { return null; },
+      async del(): Promise<number> { return 0; },
+      async set(_key: string, _value: string, opts: SetOpts): Promise<"OK" | null> {
+        return "nx" in opts && opts.nx === true ? "OK" : null;
+      },
+      // renew/release never resolve — simulates a hung Upstash REST call.
+      eval<T = unknown>(): Promise<T> { return new Promise<T>(() => {}); },
+    };
+
+    const lock = new LeaderLock(mockRedis, "test-id", {
+      ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000, renewTimeoutMs: 3_000,
+    });
+    const onDemote = vi.fn();
+    lock.start({ network: "devnet", onPromote: vi.fn(), onDemote });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(lock.role()).toBe("leader");
+
+    // Two renew cycles, each timing out at renewTimeoutMs → 2-strike demote.
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(lock.role()).toBe("standby");
+    expect(onDemote).toHaveBeenCalledWith("redis-renew-failed");
   });
 
   it("initial acquire error falls back to standby gracefully", async () => {

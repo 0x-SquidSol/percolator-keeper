@@ -6,10 +6,26 @@ const logger = createLogger("keeper:leader");
 
 export type LeaderRole = "leader" | "standby" | "starting";
 
+/**
+ * Atomic compare-and-set scripts. The lock VALUE is this node's identity, so
+ * these only mutate the key when the caller still owns it — closing the
+ * split-brain window where a stalled-then-resumed leader's blind `SET XX` renew
+ * (or unconditional `DEL`) would clobber a lock a standby legitimately took.
+ *
+ * Renew uses `pexpire` (refresh TTL, value untouched) so even renew can never
+ * rewrite a foreign value. Exported so test fakes execute the exact same logic.
+ */
+export const RENEW_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then redis.call('pexpire', KEYS[1], ARGV[2]); return 1 else return 0 end";
+export const RELEASE_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+
 export interface LeaderLockOptions {
   ttlMs?: number;
   renewMs?: number;
   pollMs?: number;
+  /** Per-call timeout for renew/release Redis ops; a hung Redis demotes instead of stranding a stale leader. */
+  renewTimeoutMs?: number;
 }
 
 export interface StartOptions {
@@ -24,6 +40,7 @@ export class LeaderLock {
   private readonly ttlMs: number;
   private readonly renewMs: number;
   private readonly pollMs: number;
+  private readonly renewTimeoutMs: number;
 
   private _role: LeaderRole = "starting";
   private _renewTimer: NodeJS.Timeout | null = null;
@@ -38,6 +55,22 @@ export class LeaderLock {
     this.ttlMs = opts.ttlMs ?? 30_000;
     this.renewMs = opts.renewMs ?? 10_000;
     this.pollMs = opts.pollMs ?? 5_000;
+    // Strictly below renewMs so a timed-out renew still leaves room for the
+    // 2-strike retry before the TTL lapses.
+    this.renewTimeoutMs = opts.renewTimeoutMs ?? Math.min(Math.floor(this.renewMs / 2), 5_000);
+  }
+
+  private async _withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`redis op timed out after ${ms}ms`)), ms);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([p, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   role(): LeaderRole {
@@ -64,8 +97,16 @@ export class LeaderLock {
 
     if (this._role === "leader") {
       try {
-        await this.redis.del(this._lockKey);
-        logger.info("LeaderLock released (graceful stop)", { identity: this.identity });
+        // Compare-and-delete: release only if we still own the lock. An
+        // unconditional `del` from a stale leader would wipe a lock a new
+        // leader currently holds.
+        const deleted = Number(
+          await this._withTimeout(
+            this.redis.eval(RELEASE_SCRIPT, [this._lockKey], [this.identity]),
+            this.renewTimeoutMs,
+          ),
+        );
+        logger.info("LeaderLock released (graceful stop)", { identity: this.identity, deleted });
       } catch (err) {
         logger.warn("LeaderLock release failed during stop", {
           identity: this.identity,
@@ -115,23 +156,33 @@ export class LeaderLock {
   private async _renew(opts: StartOptions): Promise<void> {
     if (this._role !== "leader") return;
 
-    const ttlSec = Math.ceil(this.ttlMs / 1000);
-
     try {
-      const result = await this.redis.set(this._lockKey, this.identity, { ex: ttlSec, xx: true } as { ex: number; xx?: true });
+      // Compare-and-set: refresh the TTL only if we still own the key. A blind
+      // `SET XX` here would succeed against ANY holder and let a stalled-then-
+      // resumed leader silently steal the lock back (split-brain).
+      const owned = Number(
+        await this._withTimeout(
+          this.redis.eval(RENEW_SCRIPT, [this._lockKey], [this.identity, this.ttlMs]),
+          this.renewTimeoutMs,
+        ),
+      );
 
-      if (result === "OK") {
+      if (owned === 1) {
         this._renewFailures = 0;
         this._scheduleRenew(opts);
       } else {
-        this._renewFailures++;
-        logger.warn("LeaderLock renew returned null (lock lost)", {
+        // CAS proved we are NO LONGER the owner — a standby legitimately took the
+        // lock while we stalled. Definitive loss: demote immediately, do not
+        // retry, do not touch the key (the new leader owns it).
+        logger.warn("LeaderLock renew: no longer owner (lock lost) — demoting", {
           identity: this.identity,
-          renewFailures: this._renewFailures,
         });
         this._demote("redis-lock-lost");
       }
     } catch (err) {
+      // Transport error OR timeout — ambiguous (we may still own it). Keep the
+      // 2-strike tolerance so a single blip doesn't cause needless failover, but
+      // demote on the second so a hung Redis can't strand a stale leader past TTL.
       this._renewFailures++;
       logger.warn("LeaderLock renew error", {
         identity: this.identity,
