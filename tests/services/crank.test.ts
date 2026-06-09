@@ -15,15 +15,18 @@ vi.mock('@solana/web3.js', async () => {
 // Mock all external dependencies
 vi.mock('@percolatorct/sdk', () => ({
   discoverMarkets: vi.fn(),
-  encodeKeeperCrank: vi.fn(() => Buffer.from([1, 2, 3])),
-  encodeUpdateHyperpMark: vi.fn(() => Buffer.from([7, 8, 9])),
+  encodePermissionlessCrank: vi.fn(() => Buffer.from([5, 0, 0, 0, 0, 0])),
+  CrankAction: { FeeSweep: 0, Liquidate: 1 },
   encodePushOraclePrice: vi.fn(() => Buffer.from([4, 5, 6])),
-  buildAccountMetas: vi.fn(() => []),
   buildIx: vi.fn(() => ({})),
   derivePythPushOraclePDA: vi.fn(() => [{ toBase58: () => '11111111111111111111111111111111' }, 0]),
-  detectDexType: vi.fn(() => 'raydium-clmm'),
+  fetchSlab: vi.fn(),
+  parseHeader: vi.fn(),
+  parseConfig: vi.fn(),
+  parseEngine: vi.fn(),
+  parseParams: vi.fn(),
+  detectDexType: vi.fn(() => null),
   parseDexPool: vi.fn(),
-  ACCOUNTS_KEEPER_CRANK: {},
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
 }));
 
@@ -43,6 +46,7 @@ vi.mock('@percolatorct/shared', () => ({
   })),
   getConnection: vi.fn(() => ({
     getAccountInfo: vi.fn(),
+    getSlot: vi.fn().mockResolvedValue(200),
   })),
   getFallbackConnection: vi.fn(() => ({
     getProgramAccounts: vi.fn(),
@@ -84,6 +88,15 @@ import { CrankService } from '../../src/services/crank.js';
 import * as core from '@percolatorct/sdk';
 import * as shared from '@percolatorct/shared';
 import * as keeperSendModule from '../../src/lib/keeper-send.js';
+
+const MOCK_PORTFOLIO = new PublicKey('9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin');
+
+/** v17: set keeperPortfolio on all markets after discover() so crankMarket() actually transacts */
+function setKeeperPortfolios(service: CrankService, portfolio = MOCK_PORTFOLIO) {
+  for (const state of service.getMarkets().values()) {
+    state.keeperPortfolio = portfolio;
+  }
+}
 
 describe('CrankService', () => {
   let crankService: CrankService;
@@ -216,12 +229,13 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       const result = await crankService.crankMarket(slabAddress);
 
       expect(result).toBe(true);
       expect(keeperSendModule.keeperSend).toHaveBeenCalled();
-      
+
       const state = crankService.getMarkets().get(slabAddress);
       expect(state?.successCount).toBe(1);
       expect(state?.consecutiveFailures).toBe(0);
@@ -244,13 +258,14 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error('Transaction failed'));
 
       const result = await crankService.crankMarket(slabAddress);
 
       expect(result).toBe(false);
-      
+
       const state = crankService.getMarkets().get(slabAddress);
       expect(state?.failureCount).toBe(1);
       expect(state?.consecutiveFailures).toBe(1);
@@ -275,6 +290,7 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       // Set a known baseline time via fake timers
       const startTime = 1_700_000_000_000; // fixed epoch ms
@@ -334,6 +350,7 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error('Transaction failed'));
 
@@ -347,14 +364,13 @@ describe('CrankService', () => {
       expect(state?.isActive).toBe(false);
     });
 
-    it('should cache HYPERP Raydium pool metadata and skip per-crank CU simulation', async () => {
+    it('v17: PermissionlessCrank uses skipPreflight + simulateForCU=false on repeated cranks', async () => {
+      // v17 note: HYPERP DEX pool caching was removed — tag 34 is now ConfigureHybridOracle.
+      // This test verifies the PermissionlessCrank (FeeSweep) path uses the correct keeperSend opts.
       const slabAddress = '6ka35xxxfLE5GttGNX7ZDZZz3d1VM2spSWSjArMKxe8o';
-      const poolAddress = '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv';
       const connection = {
-        getAccountInfo: vi.fn(async () => ({
-          owner: new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK'),
-          data: Buffer.alloc(1544),
-        })),
+        getAccountInfo: vi.fn(),
+        getSlot: vi.fn().mockResolvedValue(300),
       };
       vi.mocked(shared.getConnection).mockReturnValue(connection as any);
 
@@ -365,21 +381,19 @@ describe('CrankService', () => {
           collateralMint: new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
           oracleAuthority: PublicKey.default,
           indexFeedId: { toBytes: () => new Uint8Array(32) },
-          dexPool: new PublicKey(poolAddress),
         },
         params: { maintenanceMarginBps: 500n },
         header: { admin: new PublicKey('7JVQvrAfzj3aasLxCkoLYX5KQcrb5nEZhUe5Qa8PvV5G') },
       };
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
-      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-raydium', estimatedCost: 5000 } as any);
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-v17', estimatedCost: 5000 } as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       expect(await crankService.crankMarket(slabAddress)).toBe(true);
       expect(await crankService.crankMarket(slabAddress)).toBe(true);
 
-      expect(connection.getAccountInfo).toHaveBeenCalledTimes(1);
-      expect(core.detectDexType).toHaveBeenCalledTimes(1);
       expect(keeperSendModule.keeperSend).toHaveBeenCalledTimes(2);
       expect(keeperSendModule.keeperSend).toHaveBeenLastCalledWith(
         connection,
@@ -414,6 +428,7 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       // Simulate 0x4 error → permanently skipped
       vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(
@@ -449,6 +464,7 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       // Simulate 0x4 error
       vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(
@@ -486,6 +502,7 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       // Simulate multiple 0x4 errors
       vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(
@@ -627,6 +644,7 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-own-oracle', estimatedCost: 5000 } as any);
       const result = await crankService.crankMarket(slabAddress);
@@ -728,6 +746,7 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockForeignMarket, mockNormalMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       // Pre-mark the foreign oracle market as skipped (as crankMarket would do in steady state)
       const foreignState = crankService.getMarkets().get(slabForeign)!;
@@ -788,6 +807,7 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockForeignMarket, mockNormalMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService);
 
       // Simulate what crankMarket() does: set foreignOracleSkipped=true
       const foreignState = crankService.getMarkets().get(slabForeign)!;
@@ -811,7 +831,11 @@ describe('CrankService', () => {
   });
 
   describe('PERC-1254: Hyperp-mode markets with zero oracle price', () => {
-    it('should skip Hyperp market with authorityPriceE6=0 and no fetchPrice result (not count as failed)', async () => {
+    // v17: HYPERP oracle mode (UpdateHyperpMark, tag 34) was removed — tag 34 is now
+    // ConfigureHybridOracle. The hyperpNoPriceSkipped skip-logic and authorityPriceE6 guard
+    // in crankAll() no longer exist. These tests are skipped until they are rewritten
+    // against the v17 oracle model.
+    it.skip('should skip Hyperp market with authorityPriceE6=0 and no fetchPrice result (not count as failed)', async () => {
       // Regression: Small/256-slot Hyperp markets (indexFeedId=all-zeros, authorityPriceE6=0)
       // where fetchPrice returns null cause OracleInvalid (0xc) if cranked.
       // They must be skipped, not failed.
@@ -900,7 +924,7 @@ describe('CrankService', () => {
       }
     });
 
-    it('PERC-1254: should crank Hyperp market once fetchPrice returns a valid price', async () => {
+    it.skip('PERC-1254: should crank Hyperp market once fetchPrice returns a valid price', async () => {
       vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'mock-sig', estimatedCost: 5000 } as any);
 
       const slabHyperp = 'HyperpWithPrice111111111111111111111111';
@@ -966,7 +990,7 @@ describe('CrankService', () => {
       }
     });
 
-    it('PERC-1254: should reset hyperpNoPriceSkipped flag on rediscovery', async () => {
+    it.skip('PERC-1254: should reset hyperpNoPriceSkipped flag on rediscovery', async () => {
       const slabHyperp = 'HyperpReset1111111111111111111111111111';
       const ZERO_BYTES3 = new Uint8Array(32);
 

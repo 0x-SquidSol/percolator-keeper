@@ -47,15 +47,10 @@ vi.mock('@percolatorct/sdk', () => ({
   parseAccount: vi.fn(),
   parseUsedIndices: vi.fn(),
   detectLayout: vi.fn(),
-  buildAccountMetas: vi.fn(() => []),
   buildIx: vi.fn(() => ({ keys: [], programId: { toBase58: () => '11111111111111111111111111111111' }, data: Buffer.from([]) })),
-  encodeLiquidateAtOracle: vi.fn(() => Buffer.from([1])),
-  encodeKeeperCrank: vi.fn(() => Buffer.from([2])),
-  encodePushOraclePrice: vi.fn(() => Buffer.from([3])),
+  encodePermissionlessCrank: vi.fn(() => Buffer.from([5, 1, 0, 0, 0, 0])),
+  CrankAction: { FeeSweep: 0, Liquidate: 1 },
   derivePythPushOraclePDA: vi.fn(() => [{ toBase58: () => 'Oracle11111111111111111111111111111111' }, 0]),
-  ACCOUNTS_LIQUIDATE_AT_ORACLE: {},
-  ACCOUNTS_KEEPER_CRANK: {},
-  ACCOUNTS_PUSH_ORACLE_PRICE: {},
   IX_TAG: { TradeNoCpi: 1, TradeCpi: 2 },
 }));
 
@@ -77,6 +72,7 @@ vi.mock('@percolatorct/shared', () => ({
       lastValidBlockHeight: 1000000,
     })),
     sendRawTransaction: vi.fn(async () => 'mock-tx-signature'),
+    getSlot: vi.fn().mockResolvedValue(200),
   })),
   loadKeypair: vi.fn(() => {
     // Use a mock publicKey with proper equals method

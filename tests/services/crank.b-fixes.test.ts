@@ -20,22 +20,18 @@ vi.mock("@solana/web3.js", async () => {
 
 vi.mock("@percolatorct/sdk", () => ({
   discoverMarkets: vi.fn(),
-  encodeKeeperCrank: vi.fn(() => Buffer.from([1])),
-  encodeUpdateHyperpMark: vi.fn(() => Buffer.from([7])),
-  buildAccountMetas: vi.fn(() => []),
+  encodePermissionlessCrank: vi.fn(() => Buffer.from([5, 0, 0, 0, 0, 0])),
+  CrankAction: { FeeSweep: 0, Liquidate: 1 },
   buildIx: vi.fn(() => ({})),
   derivePythPushOraclePDA: vi.fn(() => [
     { toBase58: () => "Oracle111111111111111111111111111111111" },
     0,
   ]),
-  detectDexType: vi.fn(() => "raydium-clmm"),
-  parseDexPool: vi.fn(),
   parseHeader: vi.fn(),
   parseConfig: vi.fn(),
   parseEngine: vi.fn(),
   parseParams: vi.fn(),
   fetchSlab: vi.fn(),
-  ACCOUNTS_KEEPER_CRANK: {},
 }));
 
 vi.mock("@percolatorct/shared", () => ({
@@ -52,7 +48,10 @@ vi.mock("@percolatorct/shared", () => ({
     error: vi.fn(),
     debug: vi.fn(),
   })),
-  getConnection: vi.fn(() => ({ getAccountInfo: vi.fn() })),
+  getConnection: vi.fn(() => ({
+    getAccountInfo: vi.fn(),
+    getSlot: vi.fn().mockResolvedValue(200),
+  })),
   getFallbackConnection: vi.fn(() => ({
     getProgramAccounts: vi.fn(),
     getAccountInfo: vi.fn(),
@@ -96,7 +95,15 @@ import { CrankService } from "../../src/services/crank.js";
 import * as shared from "@percolatorct/shared";
 import * as keeperSendModule from "../../src/lib/keeper-send.js";
 
-function makeMarketState(opts: Partial<{ consecutiveFailures: number; failureCount: number; successCount: number; alertedAt5: boolean }> = {}) {
+const MOCK_PORTFOLIO = new PublicKey("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin");
+
+function makeMarketState(opts: Partial<{
+  consecutiveFailures: number;
+  failureCount: number;
+  successCount: number;
+  alertedAt5: boolean;
+  keeperPortfolio: PublicKey | null;
+}> = {}) {
   return {
     market: {
       slabAddress: new PublicKey("11111111111111111111111111111112"),
@@ -104,7 +111,7 @@ function makeMarketState(opts: Partial<{ consecutiveFailures: number; failureCou
       header: {},
       config: {
         oracleAuthority: PublicKey.default,
-        indexFeedId: new PublicKey(new Uint8Array(32)),
+        indexFeedId: { toBytes: () => new Uint8Array(32) },
         authorityPriceE6: 0n,
         dexPool: null,
       },
@@ -118,6 +125,8 @@ function makeMarketState(opts: Partial<{ consecutiveFailures: number; failureCou
     isActive: true,
     missingDiscoveryCount: 0,
     alertedAt5: opts.alertedAt5 ?? false,
+    // v17: keeperPortfolio must be set for crankMarket() to attempt a transaction.
+    keeperPortfolio: opts.keeperPortfolio !== undefined ? opts.keeperPortfolio : MOCK_PORTFOLIO,
   };
 }
 

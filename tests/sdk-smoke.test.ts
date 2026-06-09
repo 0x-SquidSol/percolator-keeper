@@ -7,8 +7,11 @@
  * This test does NOT make RPC calls. Everything is pure in-process computation so it
  * runs reliably in CI without any environment secrets.
  *
- * Pinned version: @percolatorct/sdk@2.0.7 (v12.19 mainnet alignment)
- * Update this comment when the workflow pins a new version.
+ * Updated for SDK 3.0.0 (v17 convergence):
+ *   - encodeKeeperCrank() now throws (v12.17 wire format rejected by v17 wrapper)
+ *   - encodeExecuteAdl()  now throws (ExecuteAdl not in v17 wrapper)
+ *   - encodePermissionlessCrank() / CrankAction are the v17 replacements
+ *   - encodeRestartAssetOracle() is the new tag-69 recovery path
  */
 
 import { describe, it, expect } from "vitest";
@@ -17,21 +20,15 @@ import { PublicKey } from "@solana/web3.js";
 // ── 1. Named-export existence ─────────────────────────────────────────────────
 // Every symbol the keeper actually imports must resolve without throwing.
 //
-// Sources:
+// v17 keeper sources:
 //   liquidation.ts — fetchSlab, parseConfig, parseEngine, parseParams, parseAccount,
-//                    parseUsedIndices, detectLayout, buildAccountMetas, buildIx,
-//                    encodeLiquidateAtOracle, encodeKeeperCrank,
-//                    ACCOUNTS_LIQUIDATE_AT_ORACLE, ACCOUNTS_KEEPER_CRANK,
+//                    parseUsedIndices, detectLayout, buildIx,
+//                    encodePermissionlessCrank, CrankAction,
 //                    derivePythPushOraclePDA, DiscoveredMarket (type)
-//   oracle.ts      — MarketConfig (type only)
-//   adl.ts         — fetchSlab, parseEngine, parseConfig, parseAllAccounts,
-//                    encodeExecuteAdl, ACCOUNTS_EXECUTE_ADL, buildAccountMetas,
-//                    buildIx, derivePythPushOraclePDA, DiscoveredMarket (type)
-//   crank.ts       — discoverMarkets, encodeKeeperCrank, encodeUpdateHyperpMark,
-//                    buildAccountMetas, buildIx, derivePythPushOraclePDA,
-//                    ACCOUNTS_KEEPER_CRANK, fetchSlab, parseHeader, parseConfig,
-//                    parseEngine, parseParams, detectDexType, parseDexPool,
-//                    DiscoveredMarket (type)
+//   crank.ts       — discoverMarkets, encodePermissionlessCrank, CrankAction,
+//                    buildIx, derivePythPushOraclePDA, fetchSlab, parseHeader,
+//                    parseConfig, parseEngine, parseParams, DiscoveredMarket (type)
+//   adl.ts         — REMOVED (empty stub in v17)
 //   monitor.ts     — fetchSlab, parseEngine, parseConfig
 //   crank-types.ts — DiscoveredMarket (type only)
 import {
@@ -46,7 +43,10 @@ import {
   parseAllAccounts,
   detectLayout,
   detectSlabLayout,
-  // instruction encoding
+  // v17 instruction encoding (replaces encodeKeeperCrank)
+  encodePermissionlessCrank,
+  CrankAction,
+  // legacy encoders — still exported but encodeKeeperCrank/encodeExecuteAdl throw
   encodeKeeperCrank,
   encodeLiquidateAtOracle,
   encodeExecuteAdl,
@@ -54,8 +54,9 @@ import {
   // account meta helpers
   buildAccountMetas,
   buildIx,
-  // ACCOUNTS_ constants
+  // ACCOUNTS_ constants (still exported for reference)
   ACCOUNTS_KEEPER_CRANK,
+  ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   ACCOUNTS_LIQUIDATE_AT_ORACLE,
   ACCOUNTS_EXECUTE_ADL,
   // PDA derivation
@@ -79,9 +80,14 @@ import type {
 // ── 2. Constants / account specs ──────────────────────────────────────────────
 
 describe("@percolatorct/sdk exports — account specs (keeper)", () => {
-  it("ACCOUNTS_KEEPER_CRANK is a non-empty readonly array", () => {
+  it("ACCOUNTS_KEEPER_CRANK is a non-empty readonly array (retained for reference)", () => {
     expect(Array.isArray(ACCOUNTS_KEEPER_CRANK)).toBe(true);
     expect(ACCOUNTS_KEEPER_CRANK.length).toBeGreaterThan(0);
+  });
+
+  it("ACCOUNTS_PERMISSIONLESS_CRANK_BASE is a non-empty readonly array (v17)", () => {
+    expect(Array.isArray(ACCOUNTS_PERMISSIONLESS_CRANK_BASE)).toBe(true);
+    expect(ACCOUNTS_PERMISSIONLESS_CRANK_BASE.length).toBeGreaterThan(0);
   });
 
   it("ACCOUNTS_LIQUIDATE_AT_ORACLE is a non-empty readonly array", () => {
@@ -89,42 +95,86 @@ describe("@percolatorct/sdk exports — account specs (keeper)", () => {
     expect(ACCOUNTS_LIQUIDATE_AT_ORACLE.length).toBeGreaterThan(0);
   });
 
-  it("ACCOUNTS_EXECUTE_ADL is a non-empty readonly array", () => {
+  it("ACCOUNTS_EXECUTE_ADL is a non-empty readonly array (retained for reference)", () => {
     expect(Array.isArray(ACCOUNTS_EXECUTE_ADL)).toBe(true);
     expect(ACCOUNTS_EXECUTE_ADL.length).toBeGreaterThan(0);
   });
 });
 
-// ── 3. encodeKeeperCrank round-trip ───────────────────────────────────────────
+// ── 3. encodeKeeperCrank removal guard + encodePermissionlessCrank round-trip ──
+// v17: encodeKeeperCrank throws at runtime — v12.17 wire format rejected by wrapper.
+// encodePermissionlessCrank is the canonical v17 replacement.
 
-describe("@percolatorct/sdk exports — encodeKeeperCrank (keeper)", () => {
-  it("encodeKeeperCrank is a function", () => {
+describe("@percolatorct/sdk exports — encodeKeeperCrank removal guard (v17)", () => {
+  it("encodeKeeperCrank is a function (still exported for type-only callers)", () => {
     expect(typeof encodeKeeperCrank).toBe("function");
   });
 
-  it("encodeKeeperCrank({callerIdx:0}) returns a non-empty Uint8Array", () => {
-    const data = encodeKeeperCrank({ callerIdx: 0 });
-    expect(data).toBeInstanceOf(Uint8Array);
-    // 1 byte tag + 2 bytes callerIdx + 1 byte format_version = 4 bytes minimum
-    expect(data.length).toBeGreaterThanOrEqual(4);
+  it("encodeKeeperCrank throws at runtime in SDK 3.0.0 — v12.17 wire rejected by v17 wrapper", () => {
+    expect(() => encodeKeeperCrank({ callerIdx: 0 })).toThrow(
+      /v12\.17 wire format is not accepted/,
+    );
+  });
+});
+
+describe("@percolatorct/sdk exports — encodePermissionlessCrank (v17 replacement)", () => {
+  it("encodePermissionlessCrank is a function", () => {
+    expect(typeof encodePermissionlessCrank).toBe("function");
   });
 
-  it("encodeKeeperCrank callerIdx is encoded at bytes 1-2 (little-endian)", () => {
-    const data = encodeKeeperCrank({ callerIdx: 1 });
-    // byte 0 = IX_TAG.KeeperCrank (5), bytes 1-2 = callerIdx LE
-    expect(data[0]).toBe(5);
-    expect(data[1]).toBe(1);
-    expect(data[2]).toBe(0);
+  it("CrankAction has FeeSweep=0 and Liquidate=1", () => {
+    expect(CrankAction.FeeSweep).toBe(0);
+    expect(CrankAction.Liquidate).toBe(1);
   });
 
-  it("encodeKeeperCrank with candidates appends candidate bytes", () => {
-    const withoutCandidates = encodeKeeperCrank({ callerIdx: 0 });
-    const withCandidates = encodeKeeperCrank({
-      callerIdx: 0,
-      candidates: [{ idx: 7, policy: 0 }],
+  it("encodePermissionlessCrank(FeeSweep) returns a non-empty Uint8Array", () => {
+    const data = encodePermissionlessCrank({
+      action: CrankAction.FeeSweep,
+      assetIndex: 0,
+      nowSlot: 0n,
+      closeQ: 0n,
+      feeBps: 0n,
+      recoveryReason: 0,
     });
-    // With a candidate the payload must be longer
-    expect(withCandidates.length).toBeGreaterThan(withoutCandidates.length);
+    expect(data).toBeInstanceOf(Uint8Array);
+    // tag(1) + action(1) + assetIndex(2) + nowSlot(8) + fundingRateE9(16) + closeQ(16) + feeBps(8) + recoveryReason(1) = 53 bytes
+    expect(data.length).toBeGreaterThanOrEqual(10);
+  });
+
+  it("encodePermissionlessCrank tag byte is IX_TAG.PermissionlessCrank (5)", () => {
+    const data = encodePermissionlessCrank({
+      action: CrankAction.FeeSweep,
+      assetIndex: 0,
+      nowSlot: 0n,
+      closeQ: 0n,
+      feeBps: 0n,
+      recoveryReason: 0,
+    });
+    expect(data[0]).toBe(5);
+  });
+
+  it("encodePermissionlessCrank action byte is 0 for FeeSweep", () => {
+    const data = encodePermissionlessCrank({
+      action: CrankAction.FeeSweep,
+      assetIndex: 0,
+      nowSlot: 0n,
+      closeQ: 0n,
+      feeBps: 0n,
+      recoveryReason: 0,
+    });
+    expect(data[1]).toBe(0); // FeeSweep = 0
+  });
+
+  it("encodePermissionlessCrank action byte is 1 for Liquidate", () => {
+    const data = encodePermissionlessCrank({
+      action: CrankAction.Liquidate,
+      assetIndex: 0,
+      nowSlot: 0n,
+      closeQ: 0n,
+      feeBps: 0n,
+      recoveryReason: 0,
+    });
+    expect(data[1]).toBe(1); // Liquidate = 1
   });
 });
 
@@ -151,22 +201,22 @@ describe("@percolatorct/sdk exports — encodeLiquidateAtOracle (keeper)", () =>
   });
 });
 
-// ── 5. encodeExecuteAdl round-trip ────────────────────────────────────────────
+// ── 5. encodeExecuteAdl removal guard (v17) ──────────────────────────────────
+// v17: ExecuteAdl (v12 tag 50/101) is not in the v17 wrapper program.
+// encodeExecuteAdl() throws removedInstruction() — runtime guard prevents
+// accidental use against v17 programs.
 
-describe("@percolatorct/sdk exports — encodeExecuteAdl (keeper/adl)", () => {
-  it("encodeExecuteAdl is a function", () => {
+describe("@percolatorct/sdk exports — encodeExecuteAdl removal guard (v17)", () => {
+  it("encodeExecuteAdl is a function (still exported for type compatibility)", () => {
     expect(typeof encodeExecuteAdl).toBe("function");
   });
 
-  it("encodeExecuteAdl({targetIdx:5}) returns a 3-byte Uint8Array", () => {
-    const data = encodeExecuteAdl({ targetIdx: 5 });
-    expect(data).toBeInstanceOf(Uint8Array);
-    expect(data.length).toBe(3);
+  it("encodeExecuteAdl throws at runtime in SDK 3.0.0 — ExecuteAdl not in v17 wrapper", () => {
+    expect(() => encodeExecuteAdl({ targetIdx: 0 })).toThrow();
   });
 
-  it("encodeExecuteAdl tag byte is IX_TAG.ExecuteAdl (50)", () => {
-    const data = encodeExecuteAdl({ targetIdx: 0 });
-    expect(data[0]).toBe(50);
+  it("encodeExecuteAdl throws for any targetIdx", () => {
+    expect(() => encodeExecuteAdl({ targetIdx: 5 })).toThrow();
   });
 });
 
@@ -218,7 +268,14 @@ describe("@percolatorct/sdk exports — buildIx (keeper)", () => {
 
   it("buildIx constructs a TransactionInstruction with correct fields", () => {
     const DUMMY = new PublicKey("11111111111111111111111111111111");
-    const data = encodeKeeperCrank({ callerIdx: 0 });
+    const data = encodePermissionlessCrank({
+      action: CrankAction.FeeSweep,
+      assetIndex: 0,
+      nowSlot: 0n,
+      closeQ: 0n,
+      feeBps: 0n,
+      recoveryReason: 0,
+    });
     const ix = buildIx({ programId: DUMMY, keys: [], data });
     expect(ix).toBeDefined();
     expect(ix.programId.toBase58()).toBe(DUMMY.toBase58());
