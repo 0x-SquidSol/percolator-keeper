@@ -56,9 +56,9 @@ What it does, in order:
 3. `InitMarket` with the BTC/USD feed id → slab is created at `market_kind = 0` (legacy perp default).
 4. `SetCouncilAuthority(council)` co-signed by admin + council → atomically binds the council pubkey AND lifts `market_kind` from 0 to 2. Per the 2026-06-04 wrapper fix this is the kind=2 init step.
 5. `LinkPolymarketMarket` co-signed by admin + council, passing the derived Pyth `PriceUpdateV2` account → binds `polymarket_condition_id`, `oracle_source = 0` (Pyth), and `metadata_uri_hash`. Stamps `linked_at_slot`.
-6. `SetPythPriceMapping` co-signed → writes `pyth_threshold_e6` pinned to the live BTC/USD price at run time, `pyth_scale_bps_per_pct = 1`, `value_deviation_bps = 1000` (max tolerance, 10 %).
+6. `SetPythPriceMapping` co-signed → writes `pyth_threshold_e6` pinned to the live BTC/USD price at run time, `pyth_scale_bps_per_pct = 1`, `value_deviation_bps = 500` (max tolerance, 5 %).
 7. `SetForceCloseTimestamp` co-signed → writes `force_close_unix_timestamp = now + 48h + 5min`.
-8. `PushOracleSnapshot(p_yes_e6 = 500_000)` signed by payer only → permissionless ring write. Threshold pinned to live price means the formula evaluates near `POLY_MID_E6 = 500_000`, so the 1000-bps deviation guard passes.
+8. `PushOracleSnapshot(p_yes_e6 = 500_000)` signed by payer only → permissionless ring write. Threshold pinned to live price means the formula evaluates near `POLY_MID_E6 = 500_000`, so the 500-bps deviation guard passes.
 
 Writes `kind2-smoke-state.json` with every pubkey + the force-close timestamp.
 

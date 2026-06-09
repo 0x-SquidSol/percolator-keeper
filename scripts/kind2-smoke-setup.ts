@@ -498,8 +498,10 @@ async function main(): Promise<void> {
   console.log(`   Live Pyth BTC price (e6): ${livePriceE6}`);
   // Pin threshold to current price so the formula evaluates to
   // POLY_MID_E6 = 500_000 at push time. scale=1 keeps the curve flat
-  // enough that small price drift doesn't blow the 1000-bps tolerance.
-  const setPythData = encodeSetPythPriceMapping(livePriceE6, 1, 1000);
+  // enough that small price drift doesn't blow the 500-bps tolerance
+  // (matches the wrapper's MAX_DEVIATION_BPS cap; previously 1000 was
+  // accepted but the cap has since been tightened).
+  const setPythData = encodeSetPythPriceMapping(livePriceE6, 1, 500);
   const setPythKeys = [
     { pubkey: payer.publicKey, isSigner: true, isWritable: false },
     { pubkey: council.publicKey, isSigner: true, isWritable: false },
