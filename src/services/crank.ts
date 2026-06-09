@@ -896,11 +896,13 @@ export class CrankService {
 
       const errMsg = err instanceof Error ? err.message : String(err);
 
-      // P1 FIX: Detect InsufficientDexLiquidity (error 0x25 = 37) specifically.
-      // This is a permanent program-level rejection — the DEX pool doesn't meet the
-      // MIN_DEX_QUOTE_LIQUIDITY threshold. Log clearly so operators know the fix is
-      // to either change the pool or redeploy the program with a lower threshold.
-      if (errMsg.includes("Custom\":37") || errMsg.includes("custom program error: 0x25")) {
+      // P1 FIX: Detect InsufficientDexLiquidity (error 0x33 = 51) specifically.
+      // This is the program's PercolatorError ordinal for the MIN_DEX_QUOTE_LIQUIDITY
+      // rejection on UpdateHyperpMark. (Ordinal 37 / 0x25 is LpVaultNoNewFees — the
+      // keeper previously matched that by mistake, so this diagnostic never fired.)
+      // Log clearly so operators know the fix is to either change the pool or
+      // redeploy the program with a lower threshold.
+      if (errMsg.includes("Custom\":51") || errMsg.includes("custom program error: 0x33")) {
         logger.error("InsufficientDexLiquidity — DEX pool does not meet program minimum liquidity threshold. " +
           "Fix: use a pool with more liquidity, or redeploy the program with a lower MIN_DEX_QUOTE_LIQUIDITY.", {
           slabAddress,
