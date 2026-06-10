@@ -118,4 +118,38 @@ describe("pythPriceToE6 — wrapper-parity vectors", () => {
     const raw = 10_000_000_000_000n;
     expect(pythPriceToE6(raw, -8)).toBe(100_000_000_000n);
   });
+
+  it("fuzz: every accepted result fits in u64 and matches the wrapper's overflow envelope", async () => {
+    // The wrapper computes the same scaling with `checked_mul` and rejects
+    // on overflow; the keeper uses BigInt (no native overflow) but
+    // explicitly compares against `U64_MAX` to mirror that rejection.
+    // This fuzz ensures the boundary contract holds for every legitimate
+    // input — a future refactor that drops the `result > U64_MAX` check
+    // (or replaces BigInt with Number) would break here, not silently in
+    // production.
+    const fc = await import("fast-check");
+    const U64_MAX = (1n << 64n) - 1n;
+    fc.assert(
+      fc.property(
+        fc.bigInt({ min: 1n, max: U64_MAX }),
+        fc.integer({ min: -18, max: 18 }),
+        (raw, expo) => {
+          const result = pythPriceToE6(raw, expo);
+          if (result === null) return true;
+          // accepted result must be a positive bigint within u64
+          if (typeof result !== "bigint") return false;
+          if (result <= 0n) return false;
+          if (result > U64_MAX) return false;
+          // and must equal the algebraic-precise BigInt computation
+          const scale = expo + 6;
+          const expected =
+            scale >= 0
+              ? raw * 10n ** BigInt(scale)
+              : raw / 10n ** BigInt(-scale);
+          return result === expected;
+        },
+      ),
+      { numRuns: 500 },
+    );
+  });
 });
