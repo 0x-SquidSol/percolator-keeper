@@ -105,6 +105,8 @@ What "normal" looks like in production. If the panels match these descriptions a
 
 - **Panel "Force-close outcomes (rate, 5m)"** — Success and Race loss are both correct outcomes; the sum equals "markets that hit T+post-buffer this window." Reject:`paused` indicates the operator pause was engaged (intentional). Reject:`not_yet_eligible` indicates host clock drift > 30s — page sysadmin.
 
+- **Settlement branch label** — `keeper_kind2_force_close_success_total{branch=...}` tags each fired force-close as `twap` (gated ring TWAP), `engine_last` (recent committed anchor fallback), `refund` (no usable price → detach all positions at zero PnL), or `unknown` (log parse miss). On a healthy actively-traded market every force-close should label `twap`. A `refund` label on a market that **had open positions** is the situation to watch: it means the ring fell below `MIN_RING_FILLS` (10) **and** the last accrual aged past `MAX_RING_STALENESS_SLOTS` (~1h) before force-close fired, so the market never had enough oracle data to settle at a trustworthy mark and every account exits at its own entry. That is the correct neutral exit for a market with no reliable price — but it also means a trader's mark-to-market position (gain or loss) was wiped. **Operational defense:** keep K3' push liveness up for the full life of every market — a single fresh `PushOracleSnapshot` within the staleness window flips settlement to `twap`/`engine_last`. Alert on any kind=2 market with non-zero open interest whose `keeper_kind2_last_push_age_secs` climbs toward `MAX_RING_STALENESS_SLOTS × 0.4s` (~3600s) so an operator can crank a manual push before force-close, rather than letting an active market settle via `refund`.
+
 ---
 
 ## 3. Incident response
