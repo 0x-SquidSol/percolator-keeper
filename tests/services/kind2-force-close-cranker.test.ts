@@ -292,7 +292,7 @@ describe("Kind2ForceCloseCranker — tick", () => {
 describe("Kind2ForceCloseCranker — branch attribution", () => {
   // The wrapper emits one msg! on success:
   //   "ForceCloseKind2: slab=... settled_price_e6=... refund_mode={true|false}
-  //    (twap_unbounded={Some|None}..., engine_last=..., ...)"
+  //    (twap_gated={Some|None}..., engine_last=..., ...)"
   // The cranker pulls logs via connection.getTransaction and labels the
   // success metric with the resolved branch. These tests pin each label
   // by feeding synthesized log lines through a stubbed getTransaction.
@@ -306,10 +306,10 @@ describe("Kind2ForceCloseCranker — branch attribution", () => {
     });
   }
 
-  it("labels branch=\"twap\" when refund_mode=false and twap_unbounded=Some(...)", async () => {
+  it("labels branch=\"twap\" when refund_mode=false and twap_gated=Some(...)", async () => {
     const registry = new StubRegistry();
     const getTx = vi.fn(txWithLog(
-      `Program log: ForceCloseKind2: slab=${SLAB_A} settled_price_e6=512345 refund_mode=false (twap_unbounded=Some(512345), engine_last=500000, force_close_unix_ts=${fcTs}, now=${nowAtFire / 1000})`,
+      `Program log: ForceCloseKind2: slab=${SLAB_A} settled_price_e6=512345 refund_mode=false (twap_gated=Some(512345), engine_last=500000, force_close_unix_ts=${fcTs}, now=${nowAtFire / 1000})`,
     ));
     const cranker = makeCranker({ registry, now: () => nowAtFire, getTransaction: getTx });
     registry.set([entryFor(SLAB_A, fcTs)]);
@@ -319,10 +319,10 @@ describe("Kind2ForceCloseCranker — branch attribution", () => {
     cranker.stop();
   });
 
-  it("labels branch=\"engine_last\" when refund_mode=false and twap_unbounded=None", async () => {
+  it("labels branch=\"engine_last\" when refund_mode=false and twap_gated=None", async () => {
     const registry = new StubRegistry();
     const getTx = vi.fn(txWithLog(
-      `Program log: ForceCloseKind2: slab=${SLAB_A} settled_price_e6=500000 refund_mode=false (twap_unbounded=None, engine_last=500000, force_close_unix_ts=${fcTs}, now=${nowAtFire / 1000})`,
+      `Program log: ForceCloseKind2: slab=${SLAB_A} settled_price_e6=500000 refund_mode=false (twap_gated=None, engine_last=500000, force_close_unix_ts=${fcTs}, now=${nowAtFire / 1000})`,
     ));
     const cranker = makeCranker({ registry, now: () => nowAtFire, getTransaction: getTx });
     registry.set([entryFor(SLAB_A, fcTs)]);
@@ -335,7 +335,7 @@ describe("Kind2ForceCloseCranker — branch attribution", () => {
   it("labels branch=\"refund\" when refund_mode=true", async () => {
     const registry = new StubRegistry();
     const getTx = vi.fn(txWithLog(
-      `Program log: ForceCloseKind2: slab=${SLAB_A} settled_price_e6=10000 refund_mode=true (twap_unbounded=None, engine_last=0, force_close_unix_ts=${fcTs}, now=${nowAtFire / 1000})`,
+      `Program log: ForceCloseKind2: slab=${SLAB_A} settled_price_e6=10000 refund_mode=true (twap_gated=None, engine_last=0, force_close_unix_ts=${fcTs}, now=${nowAtFire / 1000})`,
     ));
     const cranker = makeCranker({ registry, now: () => nowAtFire, getTransaction: getTx });
     registry.set([entryFor(SLAB_A, fcTs)]);

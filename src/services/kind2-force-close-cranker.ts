@@ -253,7 +253,7 @@ export class Kind2ForceCloseCranker {
       st.consecFailures = 0;
       st.nextEligibleMs = 0;
       // Pull tx logs to attribute the settlement branch. The wrapper
-      // emits one "ForceCloseKind2: ... refund_mode=... twap_unbounded=..."
+      // emits one "ForceCloseKind2: ... refund_mode=... twap_gated=..."
       // line on success; we parse the two relevant fields. Failures here
       // (RPC blip, missing tx, regex miss) MUST NOT mask the success — the
       // helper is internally try/catch'd and returns "unknown" so the
@@ -276,16 +276,20 @@ export class Kind2ForceCloseCranker {
    * of the three wrapper settlement paths fired. Wrapper msg! on success:
    *
    *   "ForceCloseKind2: slab={} settled_price_e6={} refund_mode={} \
-   *    (twap_unbounded={:?}, engine_last={}, force_close_unix_ts={}, now={})"
+   *    (twap_gated={:?}, engine_last={}, force_close_unix_ts={}, now={})"
+   *
+   * The `twap_gated` field carries the two-gate
+   * `ring_buf_twap_with_min_fills` result (Some when the ring passed the
+   * min-fills + recency gates, None otherwise) — NOT the unbounded helper.
    *
    * Branch detection:
-   *   * refund_mode=true                                 → "refund"
-   *   * refund_mode=false AND twap_unbounded=Some(...)   → "twap"
-   *   * refund_mode=false AND twap_unbounded=None        → "engine_last"
+   *   * refund_mode=true                              → "refund"
+   *   * refund_mode=false AND twap_gated=Some(...)    → "twap"
+   *   * refund_mode=false AND twap_gated=None         → "engine_last"
    *
    * "engine_last" is the silent-degradation case after the force-close
    * two-gate TWAP fix — operators need to know when a market quietly fell
-   * through to engine_last instead of settling at TWAP.
+   * through to engine_last instead of settling at the gated TWAP.
    *
    * Any failure path here returns "unknown" so the success count is
    * preserved. Sustained "unknown" indicates the wrapper msg! format
@@ -303,7 +307,7 @@ export class Kind2ForceCloseCranker {
       const line = logs.find((l) => l.includes("ForceCloseKind2: slab="));
       if (!line) return "unknown";
       const refundMatch = /refund_mode=(true|false)/.exec(line);
-      const twapMatch = /twap_unbounded=(Some|None)/.exec(line);
+      const twapMatch = /twap_gated=(Some|None)/.exec(line);
       if (!refundMatch || !twapMatch) return "unknown";
       if (refundMatch[1] === "true") return "refund";
       return twapMatch[1] === "Some" ? "twap" : "engine_last";

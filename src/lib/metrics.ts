@@ -463,10 +463,10 @@ export const kind2ForceCloseAttemptTotal = new Counter({
 });
 
 // `branch` reflects which of the three settlement paths the wrapper took
-// (see msg! "ForceCloseKind2: ... refund_mode={} twap_unbounded={:?} ..." in
+// (see msg! "ForceCloseKind2: ... refund_mode={} twap_gated={:?} ..." in
 // the on-chain handler):
-//   * "twap"        — refund_mode=false AND twap_unbounded=Some(...)
-//   * "engine_last" — refund_mode=false AND twap_unbounded=None (silent
+//   * "twap"        — refund_mode=false AND twap_gated=Some(...)
+//   * "engine_last" — refund_mode=false AND twap_gated=None (silent
 //                     fallback after the force-close two-gate TWAP fix —
 //                     alert-worthy as it means the gate refused the live ring)
 //   * "refund"      — refund_mode=true (ring empty, full-refund settle)
