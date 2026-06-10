@@ -125,6 +125,19 @@ function readBytesFromEnd(buf: Uint8Array, endOffset: number, length: number): U
  */
 export function decodeKind2Fields(configBytes: Uint8Array): Kind2Fields | null {
   if (configBytes.length < KIND2_MIN_CONFIG_LEN) return null;
+  // INVARIANT: callers pass a slice that ENDS at the kind=2 extension's
+  // last byte (i.e. at `_pad_governance`). End-relative offsets (-1600..0)
+  // are robust to PREFIX growth — see the "offsets are end-relative and
+  // survive prefix padding" test — but they would silently mis-read if a
+  // future MarketConfig layout appended new fields PAST `_pad_governance`,
+  // because the new tail bytes would slide into the offset window. The
+  // SDK's `detectSlabLayout` (consumed by the registry's `extractConfigRegion`)
+  // returns `configLen` per tier; that is the authoritative slice
+  // contract. If the SDK ever ships a layout where kind=2 is no longer
+  // at the tail, the registry's slice must be the kind=2 extension
+  // sub-region — NOT the full MarketConfig — and the SDK should expose
+  // a typed `MarketConfig.kind2()` accessor that obsoletes this decoder.
+  // Until then, treat the contract as "caller slices to kind=2 tail."
 
   const view = new DataView(
     configBytes.buffer,
