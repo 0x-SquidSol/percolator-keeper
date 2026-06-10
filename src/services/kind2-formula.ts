@@ -1,7 +1,7 @@
 /**
  * Bit-exact off-chain mirror of the wrapper's on-chain
  * `pyth_price_to_p_yes_e6` formula. Source of truth:
- *   `dcccrypto/percolator-prog/src/oracle_ring.rs` lines 217-244.
+ *   `dcccrypto/percolator-prog/src/oracle_ring.rs` (`pyth_price_to_p_yes_e6`).
  *
  * Used by the push cranker: the keeper computes `p_yes_e6` off-chain
  * from a Pyth observation, submits it via `PushOracleSnapshot`, and the
@@ -91,7 +91,7 @@ export function pythPriceToPYesE6(
     throw new RangeError(`scaleBpsPerPct out of i32 range: ${scaleBpsPerPct}`);
   }
 
-  // -- defensive midpoint fallback (mirrors Rust line 222-227) ----------
+  // -- defensive midpoint fallback (mirrors the Rust threshold==0 guard) --
   if (thresholdE6 === 0n) return POLY_MID_E6;
 
   // -- core arithmetic (byte-exact mirror of the Rust i128 path) --------

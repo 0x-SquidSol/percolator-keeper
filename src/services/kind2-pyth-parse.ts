@@ -9,7 +9,8 @@
  *   * `exponent` (i32) — typically negative (e.g. -8)
  *   * `publish_time` (i64) — unix seconds, the monotonicity gate
  *
- * Layout (from `dcccrypto/percolator-prog/src/percolator.rs` lines 4358-4500):
+ * Layout (from `dcccrypto/percolator-prog/src/percolator.rs`, the Pyth
+ * `PriceUpdateV2` parser feeding `read_pyth_price_e6`):
  *
  *   [0,   8): Anchor discriminator
  *   [8,  40): write_authority (Pubkey, 32 bytes)
@@ -77,7 +78,7 @@ export function parsePythPriceUpdateV2(data: Uint8Array): PriceFeed | null {
 
 /**
  * Convert a Pyth raw price + exponent to e6-scaled USD, matching the
- * wrapper's `read_pyth_price_e6` (lines 4530-4549). Returns `null` on
+ * wrapper's `read_pyth_price_e6`. Returns `null` on
  * overflow / negative price / out-of-range exponent — the wrapper
  * applies the same checks, so a `null` here means the on-chain submit
  * would reject as `OracleInvalid`.

@@ -32,7 +32,7 @@
  *
  * Source of truth for the layout:
  *   `dcccrypto/percolator-prog/src/percolator.rs` MarketConfig struct
- *   (kind=2 fields ~lines 3560-3789).
+ *   (the kind=2 fields appended at the tail of the MarketConfig struct).
  *
  * Bounds-checking: every decode function asserts `configBytes.length`
  * is at least the minimum kind=2-extended config size before reading.

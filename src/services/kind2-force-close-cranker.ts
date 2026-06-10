@@ -66,8 +66,8 @@ const logger = createLogger("keeper:kind2-force-close");
 /**
  * Hand-rolled `ForceCloseKind2` (tag 88) encoder. The on-chain handler
  * takes no instruction-data payload beyond the 1-byte tag. Source of
- * truth: `handle_force_close_kind2` at
- * `dcccrypto/percolator-prog/src/percolator.rs` line 18767.
+ * truth: `handle_force_close_kind2` in
+ * `dcccrypto/percolator-prog/src/percolator.rs`.
  */
 const TAG_FORCE_CLOSE_KIND2 = 88;
 function encodeForceCloseKind2(): Uint8Array {
@@ -323,8 +323,8 @@ export class Kind2ForceCloseCranker {
   private buildIx(slab: string): TransactionInstruction {
     const data = encodeForceCloseKind2();
     // Account layout for tag 88: [caller(signer), slab(writable)].
-    // Source-of-truth: `handle_force_close_kind2` line 18767-18324 of
-    // the wrapper. The on-chain handler reads only these two accounts;
+    // Source-of-truth: `handle_force_close_kind2` in the wrapper. The
+    // on-chain handler reads only these two accounts;
     // no clock account is passed because it's read via `Clock::get()`.
     const keys = [
       { pubkey: this.opts.payer.publicKey, isSigner: true, isWritable: false },

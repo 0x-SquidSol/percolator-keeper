@@ -75,8 +75,8 @@ function encodePushOracleSnapshot(pYesE6: bigint): Uint8Array {
 type RejectKind = "stale" | "deviation" | "resolved" | "other";
 
 /**
- * Wrapper-side error codes (mirrors `PercolatorError` enum order in
- * `dcccrypto/percolator-prog/src/percolator.rs` line 1689). The error is
+ * Wrapper-side error codes (mirrors the `PercolatorError` enum in
+ * `dcccrypto/percolator-prog/src/percolator.rs`). The error is
  * mapped to `ProgramError::Custom(e as u32)` and appears in tx logs as
  * `custom program error: 0xN`.
  */
@@ -501,7 +501,7 @@ export class Kind2PushCranker {
   private buildIx(slab: string, pythPubkey: PublicKey, pYesE6: bigint): TransactionInstruction {
     const data = encodePushOracleSnapshot(pYesE6);
     // Account layout for tag 85: [caller(signer), slab(writable), pyth(ro)].
-    // Source-of-truth: `handle_push_oracle_snapshot` line 18318 of the wrapper.
+    // Source-of-truth: `handle_push_oracle_snapshot` in the wrapper.
     const keys = [
       { pubkey: this.opts.payer.publicKey, isSigner: true, isWritable: false },
       { pubkey: new PublicKey(slab), isSigner: false, isWritable: true },
