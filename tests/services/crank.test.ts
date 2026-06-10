@@ -368,7 +368,7 @@ describe('CrankService', () => {
           dexPool: new PublicKey(poolAddress),
         },
         params: { maintenanceMarginBps: 500n },
-        header: { admin: new PublicKey('7JVQvrAfzj3aasLxCkoLYX5KQcrb5nEZhUe5Qa8PvV5G') },
+        header: { admin: new PublicKey(new Uint8Array(32).fill(0xad)) },
       };
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
