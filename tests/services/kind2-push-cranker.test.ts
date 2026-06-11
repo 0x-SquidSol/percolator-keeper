@@ -91,8 +91,17 @@ function entryFor(slab: string): Kind2Entry {
 
 class StubRegistry {
   private items: Kind2Entry[] = [];
+  private listeners: Array<(ev: { kind: string; slab: string; reason?: string }) => void> = [];
   list(): Kind2Entry[] { return this.items; }
   set(entries: Kind2Entry[]): void { this.items = entries; }
+  onChange(cb: (ev: { kind: string; slab: string; reason?: string }) => void): () => void {
+    this.listeners.push(cb);
+    return () => { this.listeners = this.listeners.filter((l) => l !== cb); };
+  }
+  /** Test hook: fire an evict event to every subscriber. */
+  fireEvict(slab: string): void {
+    for (const l of this.listeners) l({ kind: "evict", slab, reason: "test" });
+  }
 }
 
 function makeConnection(): Connection {
@@ -188,6 +197,44 @@ describe("Kind2PushCranker — gate + submit", () => {
     sendMock.mockClear();
     await cranker.tick();
     expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("clears per-slab state on registry eviction (stale watermark does not survive re-add)", async () => {
+    // Regression: the per-slab MarketState (incl. the lastSubmittedPublishTime
+    // watermark) must be deleted when the registry evicts a slab. Without it,
+    // an evicted-then-re-added slab resumes against the stale watermark, which
+    // gates (skips) every honest push at the same publish_time forever. start()
+    // wires the eviction subscription.
+    cranker.start();
+    try {
+      const entry = entryFor(SLAB_A);
+      const pythPubkey = new PublicKey(new Uint8Array(32).fill(7)).toBase58();
+      cache.set(pythPubkey, buildPythBytes(1_700_000_000n, 10_000_000_000_000n, -8), "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ", 1_000);
+      registry.set([entry]);
+      sendMock.mockResolvedValue({ signature: "sig", estimatedCost: 5_000, simulatedCu: 30_000 });
+
+      // First push at publishTime T sets the watermark.
+      await cranker.tick();
+      expect(sendMock).toHaveBeenCalledTimes(1);
+
+      // Same T → gated (watermark blocks the re-submit).
+      sendMock.mockClear();
+      await cranker.tick();
+      expect(sendMock).not.toHaveBeenCalled();
+
+      // Evict the slab → state (incl. watermark) is cleared.
+      registry.fireEvict(SLAB_A);
+
+      // Re-add the same slab; the SAME publishTime T now pushes again,
+      // proving the stale watermark did not survive the eviction.
+      registry.set([entry]);
+      sendMock.mockClear();
+      sendMock.mockResolvedValue({ signature: "sig2", estimatedCost: 5_000, simulatedCu: 30_000 });
+      await cranker.tick();
+      expect(sendMock).toHaveBeenCalledTimes(1);
+    } finally {
+      cranker.stop();
+    }
   });
 
   it("re-submits when Pyth advances", async () => {

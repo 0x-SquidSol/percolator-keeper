@@ -42,6 +42,7 @@ import { parsePythPriceUpdateV2, pythPriceToE6 } from "./kind2-pyth-parse.js";
 import { Kind2MetricsService } from "./kind2-metrics-service.js";
 import { AccountCache } from "../lib/account-cache.js";
 import { LeaderLock } from "../lib/leader.js";
+import { type UnsubscribeFn } from "../lib/account-loader.js";
 import { keeperSend, type KeeperSendResult } from "../lib/keeper-send.js";
 import { KeeperBudget } from "../lib/budget.js";
 import {
@@ -215,6 +216,8 @@ export class Kind2PushCranker {
     { reason: string; conditionIdHex: string | undefined }
   >();
   private p1FlushTimer: NodeJS.Timeout | null = null;
+  /** Registry eviction subscription — clears per-slab state on evict. */
+  private unsubscribe: UnsubscribeFn | null = null;
 
   constructor(opts: Kind2PushCrankerOptions) {
     this.opts = {
@@ -239,6 +242,21 @@ export class Kind2PushCranker {
    */
   start(): void {
     if (this.tickTimer) return;
+    // Subscribe before the timers so an eviction during the boot window
+    // is never missed. Per-slab state (the lastSubmittedPublishTime
+    // watermark, firstSeenMs, backoff, P1 dedup) must be cleared when a
+    // slab leaves the registry — otherwise a slab that is evicted and
+    // later re-inserted would resume against a stale watermark, which
+    // silently gates (skips) every honest push until on-chain Pyth
+    // advances past it, drifting the re-added market toward stale/refund
+    // with no alert. Also drop any pending P1 batch entry for the gone
+    // slab so a retired market can't fire a page.
+    this.unsubscribe = this.opts.registry.onChange((ev) => {
+      if (ev.kind === "evict") {
+        this.state.delete(ev.slab);
+        this.p1Batch.delete(ev.slab);
+      }
+    });
     this.tickTimer = setInterval(() => {
       this.tick().catch((err) => {
         logger.warn("tick threw", { err: String(err) });
@@ -259,6 +277,10 @@ export class Kind2PushCranker {
 
   /** Stop both timers. Call from `LeaderLock.start({ onDemote })`. */
   stop(): void {
+    if (this.unsubscribe) {
+      this.unsubscribe();
+      this.unsubscribe = null;
+    }
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
