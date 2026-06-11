@@ -12,6 +12,7 @@
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { PublicKey, type Connection } from "@solana/web3.js";
+import { SLAB_MAGIC } from "@percolatorct/sdk";
 import { Kind2Registry, type Kind2Entry, type ChangeEvent } from "../../src/services/kind2-registry.js";
 import { KIND2_MIN_CONFIG_LEN } from "../../src/services/kind2-decoder.js";
 import type { AccountLoader, AccountUpdate, UnsubscribeFn } from "../../src/lib/account-loader.js";
@@ -42,6 +43,11 @@ function buildSlab(overrides: {
   const slab = new Uint8Array(SLAB_HEADER_LEN + KIND2_MIN_CONFIG_LEN);
   const view = new DataView(slab.buffer);
   const end = slab.length;
+
+  // Slab magic at header offset 0 — the registry's parse() now rejects any
+  // program-owned account that does not carry it, so fixtures must be valid
+  // slabs.
+  view.setBigUint64(0, SLAB_MAGIC, true);
 
   if (overrides.polymarketConditionId) {
     slab.set(overrides.polymarketConditionId, end - 1600);
@@ -167,6 +173,23 @@ describe("Kind2Registry — hot path", () => {
     expect(entry.observedSlot).toBe(100);
     expect(evs).toHaveLength(1);
     expect(evs[0]).toMatchObject({ kind: "upsert", slab: SLAB_A.toBase58() });
+  });
+
+  it("ignores program-owned accounts that lack the slab magic", () => {
+    // Regression: a program-owned account that is otherwise shaped like an
+    // actionable kind=2 slab but carries the wrong magic at offset 0 (a
+    // different account type, an uninitialised allocation, or a crafted
+    // buffer) must NOT be decoded/tracked. Take a valid actionable slab and
+    // corrupt the 8-byte magic; the registry must reject it.
+    const bytes = actionableSlabBytes();
+    new DataView(bytes.buffer, bytes.byteOffset, 8).setBigUint64(0, 0n, true);
+    loader.fireUpdate(makeUpdate(SLAB_A, bytes, 100));
+    expect(registry.size()).toBe(0);
+    // Sanity: the same bytes WITH the magic restored ARE tracked, proving
+    // the only thing that changed is the magic gate.
+    new DataView(bytes.buffer, bytes.byteOffset, 8).setBigUint64(0, SLAB_MAGIC, true);
+    loader.fireUpdate(makeUpdate(SLAB_A, bytes, 101));
+    expect(registry.size()).toBe(1);
   });
 
   it("ignores updates with non-Pyth oracle_source (V1 fail-closed)", () => {

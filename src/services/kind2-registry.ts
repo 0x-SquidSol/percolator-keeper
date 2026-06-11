@@ -33,7 +33,7 @@
  */
 
 import { PublicKey, type Connection } from "@solana/web3.js";
-import { parseConfig, detectSlabLayout } from "@percolatorct/sdk";
+import { parseConfig, detectSlabLayout, SLAB_MAGIC } from "@percolatorct/sdk";
 import { createLogger } from "@percolatorct/shared";
 import { type AccountUpdate, type AccountLoader, type UnsubscribeFn } from "../lib/account-loader.js";
 import {
@@ -391,6 +391,22 @@ export class Kind2Registry {
     source: EntrySource,
   ): Kind2Entry | null {
     if (data.length < SLAB_HEADER_LEN + 0) return null;
+    // Slab magic guard: only decode genuine percolator slabs. The
+    // stream/RPC scan is filtered by program owner, but a program-owned
+    // account that is NOT a valid slab — a different account type, an
+    // uninitialised allocation, or (in the worst case) an attacker-crafted
+    // program-owned buffer of an SDK-unrecognised length that would fall
+    // through to the fixed `extractConfigRegion` window — must not be
+    // mis-read as a kind=2 market via the end-relative offsets. The 8-byte
+    // magic at header offset 0 ("PERCOLAT") is the cheapest authoritative
+    // discriminator; reject anything that does not carry it. SLAB_MAGIC is
+    // the SDK's single source of truth for the value.
+    const magic = new DataView(
+      data.buffer,
+      data.byteOffset,
+      data.byteLength,
+    ).getBigUint64(0, true);
+    if (magic !== SLAB_MAGIC) return null;
     // The MarketConfig starts immediately after the header; we don't
     // know exactly where it ends, so the decoder treats the buffer as
     // "MarketConfig from HEADER_LEN to end-of-buffer minus the engine
