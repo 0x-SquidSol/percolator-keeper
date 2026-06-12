@@ -33,7 +33,7 @@
  */
 
 import { PublicKey, type Connection } from "@solana/web3.js";
-import { parseConfig, detectSlabLayout, SLAB_MAGIC } from "@percolatorct/sdk";
+import { detectSlabLayout, SLAB_MAGIC } from "@percolatorct/sdk";
 import { createLogger } from "@percolatorct/shared";
 import { type AccountUpdate, type AccountLoader, type UnsubscribeFn } from "../lib/account-loader.js";
 import {
@@ -65,6 +65,14 @@ const DEFAULT_RECONCILE_MS = 5 * 60_000;
  * on the wrapper's current layout.
  */
 const SLAB_HEADER_LEN = 136;
+
+/**
+ * Config-relative byte offset of `MarketConfig.index_feed_id` (32 bytes).
+ * Start-relative (a base field, unlike the end-relative kind=2 tail).
+ * Read directly because the SDK's `parseConfig` has a stale offset for the
+ * V13 layout. Verified against a live devnet slab (2026-06).
+ */
+const INDEX_FEED_ID_CONFIG_OFFSET = 64;
 
 export type EntrySource = "seed" | "stream" | "reconcile";
 
@@ -443,18 +451,17 @@ export class Kind2Registry {
       // previously tracked.
       return null;
     }
-    // Pyth feed id lives on `MarketConfig.index_feed_id`, which is a
-    // legacy field the SDK already exposes. Read via the SDK accessor
-    // rather than hand-rolling another offset; downstream cranks need
-    // it to derive the Pyth account PDA. SDK parse failures here are
-    // recoverable — we skip this update; the registry's hot path will
-    // retry on the next slab account change.
-    let pythFeedId: Uint8Array;
-    try {
-      pythFeedId = parseConfig(data).indexFeedId.toBytes();
-    } catch {
-      return null;
-    }
+    // Pyth feed id lives on `MarketConfig.index_feed_id`. Downstream cranks
+    // need it to derive the bound Pyth account PDA. The SDK's `parseConfig`
+    // reads this at a STALE offset for the V13 (2176-byte) layout and returns
+    // the wrong 32 bytes — so the derived Pyth PDA points at a non-existent
+    // account and no snapshot ever gets pushed. Read it directly instead.
+    // index_feed_id is a base MarketConfig field at config offset
+    // INDEX_FEED_ID_CONFIG_OFFSET (start-relative, unlike the end-relative
+    // kind=2 tail), verified against a live devnet slab (2026-06).
+    const feedStart = SLAB_HEADER_LEN + INDEX_FEED_ID_CONFIG_OFFSET;
+    if (data.length < feedStart + 32) return null;
+    const pythFeedId = new Uint8Array(data.slice(feedStart, feedStart + 32));
     return {
       slab,
       programId,

@@ -40,18 +40,22 @@
  */
 
 /**
- * Minimum byte length of `MarketConfig` after the kind=2 extension lands.
- * Anything shorter than this is a pre-V13 MarketConfig and the kind=2
- * fields are not present. The keeper treats those slabs as "not kind=2"
- * and ignores them for registry purposes.
+ * Byte length of the on-chain `MarketConfig` (== size_of::<MarketConfig>()).
+ * The registry's RPC-fallback slice ends at HEADER_LEN + this, so it MUST
+ * equal the deployed struct size or the end-relative kind=2 offsets read the
+ * wrong bytes. Anything shorter is a pre-extension MarketConfig with no kind=2
+ * fields, which the keeper ignores for registry purposes.
  *
- * The exact V13 CONFIG_LEN is fixed by the on-chain Rust struct's
- * `size_of::<MarketConfig>()` and is verified in `kind2-decoder.test.ts`
- * by round-tripping a fixture buffer through the decoder. If the layout
- * grows again (a new extension appended past `_pad_governance`), this
- * constant and the end-relative offsets above must both update.
+ * Verified against a live devnet slab (2026-06): the deployed kind=2
+ * MarketConfig is 2176 bytes. The kind=2 extension is the LAST 1600 bytes
+ * (the end-relative offsets below are unchanged); the config grew vs. the
+ * original 1600 by adding 576 bytes in the BASE region ahead of the
+ * extension, which end-relative offsets are robust to. If the layout grows
+ * again (or the SDK ships V13 tier sizes so detectSlabLayout stops returning
+ * null for these slabs), update this constant to the new
+ * `size_of::<MarketConfig>()`.
  */
-export const KIND2_MIN_CONFIG_LEN = 1600;
+export const KIND2_MIN_CONFIG_LEN = 2176;
 
 /** End-relative offsets within `MarketConfig`. All negative. */
 const OFF_PAD_GOVERNANCE_END = 0;
