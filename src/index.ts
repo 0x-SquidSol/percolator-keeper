@@ -10,6 +10,7 @@ import { MonitorService } from "./services/monitor.js";
 import { FraudDetectorService } from "./services/fraud-detector.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
+import { CURRENT_NETWORK } from "./network.js";
 import { assertMainnetProgramId } from "./lib/boot-assertions.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
 import { walletBalanceSol, activeMarketsCount, registerDefaultMetrics } from "./lib/metrics.js";
@@ -30,9 +31,31 @@ initSentry("keeper");
 
 const logger = createLogger("keeper");
 
+// M1: grace-gated deprecation of KEEPER_PRIVATE_KEY. The legacy alias used
+// to fall through silently with only `logger.warn` — operators had no
+// migration pressure and the deprecation was invisible on dashboards.
+// The fix:
+//   - if both vars are unset → throw (unchanged)
+//   - if CRANK_KEYPAIR is set → use it (unchanged; legacy is ignored)
+//   - if only KEEPER_PRIVATE_KEY is set → require an explicit opt-in
+//     (KEEPER_ALLOW_LEGACY_PRIVATE_KEY=true) for one more release cycle.
+//     Otherwise throw with migration instructions.
+// Boot-time keypair parseability is validated by validateKeeperEnvGuards()
+// at line 42 — catches malformed input here rather than 60s later inside
+// the SOL-balance interval.
 if (!process.env.CRANK_KEYPAIR) {
   if (process.env.KEEPER_PRIVATE_KEY) {
-    logger.warn("KEEPER_PRIVATE_KEY is deprecated — rename to CRANK_KEYPAIR in your .env");
+    if (process.env.KEEPER_ALLOW_LEGACY_PRIVATE_KEY !== "true") {
+      throw new Error(
+        "KEEPER_PRIVATE_KEY is deprecated and will be removed in a future release. " +
+          "Rename it to CRANK_KEYPAIR in your .env / Railway config, OR set " +
+          "KEEPER_ALLOW_LEGACY_PRIVATE_KEY=true to keep using the legacy name " +
+          "for one more release cycle.",
+      );
+    }
+    logger.warn(
+      "KEEPER_PRIVATE_KEY fallback active — migration to CRANK_KEYPAIR required before next release",
+    );
     process.env.CRANK_KEYPAIR = process.env.KEEPER_PRIVATE_KEY;
   } else {
     throw new Error("CRANK_KEYPAIR must be set for keeper service");
@@ -40,6 +63,15 @@ if (!process.env.CRANK_KEYPAIR) {
 }
 
 validateKeeperEnvGuards();
+
+// M2: cache the keeper signing keypair at boot. Previously `loadKeypair` was
+// called inside the 60s SOL-balance interval — re-parsing the same JSON/base58
+// every tick (wasteful) AND lumping keypair-format errors with RPC errors in
+// the catch block (silently degraded as warn). Hoisting the load to module
+// scope means a malformed keypair fails at boot (clean supervisor restart)
+// instead of producing a "keeper appears healthy but can't sign anything"
+// degraded state.
+const keeperKeypair = loadKeypair(process.env.CRANK_KEYPAIR!);
 
 // If NETWORK=mainnet, the keeper runs against mainnet program (requires FORCE_MAINNET=1).
 // On mainnet, HYPERP markets (SOL-PERP, BTC-PERP, ETH-PERP) use the keeper as oracle authority
@@ -103,7 +135,12 @@ let _lastSolBalanceAlertTime = 0;
 
 const solBalanceCheckInterval = setInterval(async () => {
   try {
-    const keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+    // M2: reuse the keypair loaded at boot. The catch block below now only
+    // sees RPC errors, not keypair-format errors (those fail at boot when
+    // the module-scope loadKeypair call above throws). This lets ops
+    // distinguish "keeper can't sign" (boot failure) from "RPC outage"
+    // (transient warn).
+    const keypair = keeperKeypair;
     const conn = getConnection();
     const lamports = await conn.getBalance(keypair.publicKey);
     _keeperSolBalanceLamports = lamports;
@@ -672,7 +709,10 @@ async function start() {
     // A.3: env-guards asserts NETWORK is set to mainnet|devnet whenever
     // HA_ENABLED=true, so the previous `?? "devnet"` fallback is gone —
     // a missing NETWORK would silently share a lock with the wrong cluster.
-    const network = process.env.NETWORK!;
+    // Use the normalized CURRENT_NETWORK (not raw process.env.NETWORK) so two
+    // nodes differing only by case/whitespace ("Mainnet" vs "mainnet") derive
+    // the SAME lock key and cannot both become leader.
+    const network = CURRENT_NETWORK;
     leaderLock.start({
       network,
       onPromote: () => {
