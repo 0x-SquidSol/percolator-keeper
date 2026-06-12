@@ -3,3 +3,13 @@ dist/
 .env
 *.tsbuildinfo
 .pnpm-store/
+
+# Devnet smoke/trial artifacts — NEVER commit these.
+# kind2-smoke-council.json is a PRIVATE KEYPAIR; the state file leaks the
+# devnet deployment's pubkeys. RPC keys live only in env vars / .env.
+kind2-smoke-state.json
+kind2-smoke-council.json
+*.keypair.json
+*-keypair.json
+# Any local run logs
+*.log
