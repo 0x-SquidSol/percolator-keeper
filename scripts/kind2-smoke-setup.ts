@@ -48,7 +48,6 @@ import {
   createInitializeMintInstruction,
   createAssociatedTokenAccountInstruction,
   createMintToInstruction,
-  createTransferInstruction,
   getAssociatedTokenAddress,
   getMinimumBalanceForRentExemptMint,
   MINT_SIZE,
@@ -85,6 +84,18 @@ const COUNCIL_KEYPAIR_PATH = process.env.COUNCIL_KEYPAIR ?? "./kind2-smoke-counc
 
 const TIER_NAME = (process.env.KIND2_SLAB_TIER ?? "large") as keyof typeof SLAB_TIERS;
 const TIER = SLAB_TIERS[TIER_NAME];
+
+// The SDK's SLAB_TIERS.dataSize tracks the pre-kind=2 (V12_19) slab layout.
+// The kind=2 (V13) MarketConfig appends the oracle ring + governance fields,
+// so the on-chain SLAB_LEN the deployed wrapper expects is LARGER than the
+// SDK constant — allocating the SDK size makes InitMarket fail with
+// InvalidSlabLen (0x4). The wrapper logs its expected SLAB_LEN as the first
+// sol_log_64 value on that failure (e.g. 0x1ba40 = 112704 for the small/256
+// build). Until the SDK ships V13 tier sizes, set KIND2_SLAB_BYTES to that
+// value to allocate the slab the program actually wants.
+const SLAB_BYTES = process.env.KIND2_SLAB_BYTES
+  ? Number(process.env.KIND2_SLAB_BYTES)
+  : TIER.dataSize;
 
 // Canonical Pyth feed id for BTC/USD (Pyth Pull format). Same id on devnet
 // and mainnet — the Push Oracle program writes deterministic PDAs keyed
@@ -295,7 +306,7 @@ async function main(): Promise<void> {
   console.log(`   Program:  ${PROGRAM_ID.toBase58()}`);
   console.log(`   Payer:    ${payer.publicKey.toBase58()}`);
   console.log(`   Council:  ${council.publicKey.toBase58()}`);
-  console.log(`   Tier:     ${TIER_NAME} (${TIER.dataSize} bytes)`);
+  console.log(`   Tier:     ${TIER_NAME} (${SLAB_BYTES} bytes${process.env.KIND2_SLAB_BYTES ? " — KIND2_SLAB_BYTES override" : ""})`);
   console.log(`   Feed id:  ${BTC_USD_FEED_ID_HEX}`);
   const balance = await conn.getBalance(payer.publicKey);
   console.log(`   Balance:  ${balance / LAMPORTS_PER_SOL} SOL`);
@@ -359,7 +370,7 @@ async function main(): Promise<void> {
 
   console.log("Step 3: Create slab account");
   const slabKp = Keypair.generate();
-  const slabRent = await conn.getMinimumBalanceForRentExemption(TIER.dataSize);
+  const slabRent = await conn.getMinimumBalanceForRentExemption(SLAB_BYTES);
   console.log(`   Slab rent: ${slabRent / LAMPORTS_PER_SOL} SOL`);
   await send(
     new Transaction().add(
@@ -368,7 +379,7 @@ async function main(): Promise<void> {
         fromPubkey: payer.publicKey,
         newAccountPubkey: slabKp.publicKey,
         lamports: slabRent,
-        space: TIER.dataSize,
+        space: SLAB_BYTES,
         programId: PROGRAM_ID,
       }),
     ),
@@ -393,16 +404,15 @@ async function main(): Promise<void> {
     `Vault ATA ${vaultAta.toBase58().slice(0, 12)}...`,
   );
 
-  console.log("Step 5: Seed deposit to vault");
-  const SEED_AMOUNT = 1_000_000_000n; // 1000 tokens at 6 decimals
-  await send(
-    new Transaction().add(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }),
-      createTransferInstruction(payerAta, vaultAta, payer.publicKey, SEED_AMOUNT),
-    ),
-    [payer],
-    `Seed ${SEED_AMOUNT}`,
-  );
+  // NOTE: the vault must be EMPTY at InitMarket time — the wrapper's
+  // verify_vault_empty rejects a non-zero balance (InvalidAccountData).
+  // Pre-funding it here (the previous "Step 5: seed deposit") is therefore
+  // invalid ordering. The smoke flow never opens a position, so the vault
+  // needs no balance: InitMarket leaves engine.vault == 0 and force-close on
+  // an empty market refunds nothing. If a future smoke variant needs funded
+  // collateral, deposit it AFTER InitMarket via the proper deposit
+  // instruction (which updates the engine's vault accounting), never by a
+  // raw transfer into the vault token account.
 
   // ─── Phase B — InitMarket + governance setters ───────────────────
 
@@ -411,7 +421,12 @@ async function main(): Promise<void> {
     admin: payer.publicKey,
     collateralMint: mintKp.publicKey,
     indexFeedId: BTC_USD_FEED_ID_HEX,
-    maxStalenessSecs: "60",
+    // Devnet Pyth updates irregularly with occasional >60s gaps, which made
+    // InitMarket (and would make every push) fail OracleStale at the 60s
+    // default. 300s rides over devnet gaps; production would use a tight
+    // value (mainnet Pyth updates sub-second). Override via
+    // KIND2_MAX_STALENESS_SECS. Wrapper cap is MAX_ORACLE_STALENESS_SECS=86400.
+    maxStalenessSecs: process.env.KIND2_MAX_STALENESS_SECS ?? "300",
     confFilterBps: 500,
     invert: 0,
     unitScale: 0,
@@ -423,18 +438,60 @@ async function main(): Promise<void> {
     maxAccounts: TIER.maxAccounts.toString(),
     newAccountFee: "1000000",
     maintenanceFeePerSlot: "0",
-    maxCrankStalenessSlots: "100",
-    liquidationFeeBps: "100",
-    liquidationFeeCap: "0",
-    liquidationBufferBps: "50",
+    // Values aligned to the engine's known-good init params
+    // (percolator-prog tests/common/mod.rs init_market_with_cap), which
+    // provably pass init_in_place's solvency envelope. The prior set
+    // (liquidation_fee_bps=100 + liquidation_fee_cap=0) pushed the
+    // linear loss budget past maintenance_margin and degenerated the
+    // capped-fee proof -> EngineOverflow.
+    maxCrankStalenessSlots: "99",
+    liquidationFeeBps: "50",
+    liquidationFeeCap: "1000000000000",
+    liquidationBufferBps: "100",
     minLiquidationAbs: "0",
-    // Required SDK fields — non-zero values force the wrapper's
-    // min-margin gates to fire on dust positions; 0 disables both.
-    // The smoke test never opens a position, so the disabled values
-    // are correct.
-    minNonzeroMmReq: "0",
-    minNonzeroImReq: "0",
+    // The wrapper REQUIRES min_nonzero_mm_req > 0 AND
+    // min_nonzero_mm_req < min_nonzero_im_req (InitMarket rejects 0 or
+    // mm >= im with InvalidInstructionData). 0/0 is no longer a valid
+    // "disabled" encoding. The smoke test never opens a position, so the
+    // exact values are inert — they only need to satisfy 0 < mm < im.
+    minNonzeroMmReq: "21",
+    minNonzeroImReq: "22",
+    // Extended tail (66-byte InitMarketExtendedTail). REQUIRED here: the
+    // slab is created at market_kind=0 with a real (non-zero) index_feed_id,
+    // so the wrapper treats it as a non-hyperp market and demands
+    // permissionless resolution enabled (permissionless_resolve_stale_slots
+    // > 0) — without the tail those fields default to 0 and InitMarket
+    // rejects with InvalidConfigParam (0x1a). Constraints the wrapper
+    // enforces when the tail is present (percolator.rs handle_init_market):
+    //   - permissionlessResolveStaleSlots: > 0 and <= 6_480_000.
+    //   - forceCloseDelaySlots: > 0 (required once permissionless resolve
+    //     is on, else InvalidInstructionData).
+    //   - fundingHorizonSlots: > 0 — the tail makes it Some(fh) and the
+    //     handler rejects Some(0); funding itself stays disabled via
+    //     fundingKBps = 0, so the horizon value is inert but must be > 0.
+    // These are kind=0 resolution/funding knobs; once SetCouncilAuthority
+    // lifts the slab to kind=2 the force_close_unix_timestamp mechanism
+    // governs settlement and funding is zero, so the values only need to be
+    // valid, not tuned.
+    extendedTail: {
+      insuranceWithdrawMaxBps: 0,
+      insuranceWithdrawCooldownSlots: "0",
+      permissionlessResolveStaleSlots: "1000000",
+      fundingHorizonSlots: "216000",
+      fundingKBps: "0",
+      fundingMaxPremiumBps: "0",
+      fundingMaxBpsPerSlot: "0",
+      markMinFee: "0",
+      forceCloseDelaySlots: "1000000",
+    },
   });
+  // Account index 7 (the SDK spec still calls it the legacy "dummyAta"
+  // placeholder) is read by the current wrapper as the Pyth oracle account:
+  // InitMarket seeds engine.last_oracle_price from a real price at init for
+  // non-hyperp markets (read_engine_price_e6 on accounts[7]). Pass the bound
+  // BTC/USD Pyth PriceUpdateV2 account here, NOT vaultPda — the wrapper
+  // derives the vault authority itself and never takes it as an account.
+  const [initOracleAccount] = derivePythPushOraclePDA(BTC_USD_FEED_ID_HEX);
   const initMarketKeys = buildAccountMetas(ACCOUNTS_INIT_MARKET, [
     payer.publicKey,
     slabKp.publicKey,
@@ -443,12 +500,14 @@ async function main(): Promise<void> {
     WELL_KNOWN.tokenProgram,
     WELL_KNOWN.clock,
     WELL_KNOWN.rent,
-    vaultPda,
+    initOracleAccount,
     WELL_KNOWN.systemProgram,
   ]);
   await send(
     new Transaction().add(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+      // InitMarket zero-inits the slab's config + engine + gen table; for a
+      // populated slab tier this exceeds 300k CU, so request the max.
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
       buildIx(PROGRAM_ID, initMarketKeys, initMarketData),
     ),
