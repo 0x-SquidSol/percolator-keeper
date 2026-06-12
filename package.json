@@ -8,6 +8,7 @@
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
     "kind2:devnet-run": "tsx scripts/kind2-devnet-run.ts",
+    "kind2:status": "tsx scripts/kind2-devnet-status.ts",
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest"
