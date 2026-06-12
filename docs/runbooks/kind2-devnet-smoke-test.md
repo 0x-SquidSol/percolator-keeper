@@ -76,20 +76,41 @@ Each step prints `✅` with a transaction signature. The state file ends with `f
 | `OracleStale` on PushOracleSnapshot | Pyth feed hasn't updated within `max_staleness_secs = 60` | Wait 30–60 s for the next Pyth tick and re-run only the push step manually. |
 | `SetForceCloseTimestamp: ...< 172800 secs in future...` | Clock drift between client and devnet validators | Re-run the setup; the script computes the timestamp from local `Date.now()`. |
 
-### Optional: boot the keeper against the new slab
+### Run the keeper against the new slab (self-contained devnet runner)
 
-Once setup completes, the K1' registry will discover the new kind=2 slab via its periodic scan or the LaserStream account-update stream. To exercise the K3'/K4'/K5' stack against it:
+The production keeper entrypoint (`pnpm dev` / `src/index.ts`) does **not** mount the kind=2 services — it starts only the legacy perp/hyperp stack (oracle, crank, liquidation, monitor, fraud, ADL). The kind=2 services (`Kind2Registry`, `Kind2PushCranker`, `Kind2ForceCloseCranker`, `Kind2MetricsService`) ship as a fully-tested library but are not wired into the running binary yet, so they need a dedicated entrypoint. Use the self-contained devnet runner:
+
 ```
-NETWORK=devnet \
+KIND2_PROGRAM_ID=<id> \
 PROGRAM_ID=<id> \
+NETWORK=devnet \
 HELIUS_DEVNET_API_KEY=<key> \
-pnpm dev
+DEPLOYER_KEYPAIR=/path/to/payer.json \
+DRY_RUN=true \
+  pnpm run kind2:devnet-run
 ```
-- The K3' push cranker should start submitting `PushOracleSnapshot` every ~500 ms (subject to Pyth `publish_time` advancing).
-- The K4' force-close cranker will tick every 5 s and stay quiet until the force-close timestamp elapses.
-- The K5' metrics dashboard panels `kind2_last_push_age_secs` and `kind2_time_to_force_close_secs` should show the slab.
 
-Booting the keeper is not required for the smoke test to succeed — the setup script's single push is enough — but it validates the keeper's end-to-end wiring.
+The runner is deliberately self-contained so we can exercise the kind=2 keeper **on our own devnet deployment without upstream having to merge the branch and without a Helius LaserStream gRPC subscription**:
+
+- **RPC-only discovery.** Instead of the production LaserStream account stream, it seeds the registry with one `getProgramAccounts` scan (`reconcileNow()`) at boot and runs the periodic RPC reconcile loop. The new slab appears within one scan.
+- **Built-in Pyth feeder.** The production push cranker reads each market's bound Pyth `PriceUpdateV2` account from the shared `AccountCache`, which is normally populated by the LaserStream subscription. With no stream, the runner owns a ~1 s loop that derives each market's Pyth account (same `derivePythPushOraclePDA(feedIdHex)` the cranker uses), batch-fetches them via `getMultipleAccountsInfo`, and writes them into the cache. Without this the push cranker would skip every market with `pyth_cache_miss`.
+- **No Redis / single-node.** `LeaderLock` is stubbed (the push cranker never calls it), so no HA infra is needed.
+
+Env vars:
+- `KIND2_PROGRAM_ID` — the deployed wrapper program id (required).
+- `PROGRAM_ID` + `NETWORK=devnet` — required by `@percolatorct/shared`'s startup config check (the same check the production keeper satisfies; this is **not** the mainnet program guard). Set `PROGRAM_ID` to the same id.
+- `HELIUS_DEVNET_API_KEY` — optional; falls back to public devnet RPC (slower, rate-limits Pyth reads).
+- `DEPLOYER_KEYPAIR` — the payer/crank signer (default `/tmp/deployer.json`).
+- `DRY_RUN=true` — **start here.** Every would-fire push and force-close is intercepted and logged with its full instruction, but no transaction is sent and no SOL is spent. Drop it (or set `false`) for a live run once the dry-run output looks right.
+- `KIND2_DEVNET_VERBOSE=true` — optional per-loop Pyth-feeder logs.
+
+What to watch:
+- Startup prints the program id, RPC, payer, DRY_RUN state, and the market count after the seed scan (`Registry seeded: N actionable kind=2 market(s)`). If it reports 0, run Phase 1 setup first.
+- A `[status]` line every ~15 s: `markets`, `cacheEntries` (should be ≥ 1 once the Pyth feeder warms up), and `nearestForceCloseInSecs` (counts down).
+- The push cranker should submit (or, under `DRY_RUN`, log) `PushOracleSnapshot` roughly every slot as Pyth `publish_time` advances — and at most **one push per slot** (the wrapper's burst-stuffing gate rejects same-slot pushes). Watch the ring fill across distinct slots.
+- The force-close cranker ticks every 5 s and stays quiet until `force_close_unix_timestamp` elapses, then fires `ForceCloseKind2`.
+
+Running the runner is not required for the smoke test to pass — the setup script's single push is enough to reach Phase 2 manually — but it is the realistic end-to-end exercise: it populates the ring across many slots (so the force-close captures a real multi-slot TWAP rather than a single seeded snapshot) and, in a live (non-dry) run, **fires the force-close automatically** at the timestamp, making the Phase 2 manual close a fallback rather than the primary path. Ctrl-C stops all services cleanly.
 
 ## The 48-hour wait
 
