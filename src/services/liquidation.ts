@@ -13,7 +13,6 @@ import {
   encodeKeeperCrank,
   ACCOUNTS_LIQUIDATE_AT_ORACLE,
   ACCOUNTS_KEEPER_CRANK,
-  derivePythPushOraclePDA,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
 import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
@@ -27,6 +26,7 @@ import {
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
+import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { AlertAggregator } from "../lib/alert-aggregator.js";
 
@@ -389,9 +389,12 @@ export class LiquidationService {
 
       // Determine oracle account for crank/liquidate
       const feedIdBytes = market.config.indexFeedId.toBytes();
-      const feedHex = Array.from(feedIdBytes).map(b => b.toString(16).padStart(2, "0")).join("");
-      const isAllZeros = feedHex === "0".repeat(64);
-      const oracleAccount = isAllZeros ? slabAddress : derivePythPushOraclePDA(feedHex)[0];
+      const isAllZeros = feedIdBytes.every((b) => b === 0);
+      // HYPERP → slab; external feed → resolve Pyth vs Chainlink by account owner
+      // (Chainlink markets need index_feed_id, not a derived Pyth PDA).
+      const oracleAccount = isAllZeros
+        ? slabAddress
+        : await resolveExternalOracleAccount(market.config.indexFeedId, connection);
 
       // 1. Crank (make sure engine state is fresh)
       const crankData = encodeKeeperCrank({ callerIdx: 65535 });

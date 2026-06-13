@@ -6,7 +6,6 @@ import {
   encodeUpdateHyperpMark,
   buildAccountMetas,
   buildIx,
-  derivePythPushOraclePDA,
   ACCOUNTS_KEEPER_CRANK,
   fetchSlab,
   parseHeader,
@@ -31,6 +30,7 @@ import {
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
+import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 
 const logger = createLogger("keeper:crank");
@@ -855,9 +855,10 @@ export class CrankService {
       if (this.isAdminOracle(market)) {
         oracleKey = market.slabAddress;
       } else {
-        const feedHex = Array.from(market.config.indexFeedId.toBytes())
-          .map(b => b.toString(16).padStart(2, "0")).join("");
-        oracleKey = derivePythPushOraclePDA(feedHex)[0];
+        // Pyth vs Chainlink is indistinguishable from config; resolve by the
+        // on-chain account owner so Chainlink markets get index_feed_id (the
+        // aggregator) instead of a wrong derived Pyth PDA.
+        oracleKey = await resolveExternalOracleAccount(market.config.indexFeedId, connection);
       }
 
       const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [

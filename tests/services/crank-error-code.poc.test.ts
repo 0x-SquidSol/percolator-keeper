@@ -31,8 +31,8 @@ vi.mock("@percolatorct/sdk", () => ({
 vi.mock("@percolatorct/shared", () => ({
   config: { crankIntervalMs: 30000, crankInactiveIntervalMs: 120000, discoveryIntervalMs: 300000, allProgramIds: ["11111111111111111111111111111111"], crankKeypair: "mock" },
   createLogger: () => h.logger, // singleton so we can assert on the module logger
-  getConnection: () => ({}),
-  getFallbackConnection: () => ({}),
+  getConnection: () => ({ getAccountInfo: vi.fn(async () => null) }),
+  getFallbackConnection: () => ({ getAccountInfo: vi.fn(async () => null) }),
   loadKeypair: () => ({ publicKey: { toBase58: () => "11111111111111111111111111111111", equals: () => false } }),
   sendWithRetryKeeper: vi.fn(),
   eventBus: { publish: vi.fn() },
@@ -56,7 +56,7 @@ function nonHyperpMarket(slab: string) {
     programId: { toBase58: () => "11111111111111111111111111111111" },
     config: {
       collateralMint: { toBase58: () => "Mint1111111111111111111111111111111111" },
-      indexFeedId: { toBytes: () => feed, equals: () => false },
+      indexFeedId: { toBytes: () => feed, toBase58: () => "FeedNonZero11111111111111111111111111111111", equals: () => false },
       oracleAuthority: { toBase58: () => "11111111111111111111111111111111", equals: () => true },
     },
     params: { maintenanceMarginBps: 500n },

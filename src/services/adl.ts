@@ -41,7 +41,6 @@ import {
   ACCOUNTS_EXECUTE_ADL,
   buildAccountMetas,
   buildIx,
-  derivePythPushOraclePDA,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
 import {
@@ -55,6 +54,7 @@ import type { MarketCrankState } from "./crank-types.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import { txSentTotal, solSpentLamportsTotal, txLandTimeSeconds } from "../lib/metrics.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
+import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 
 const logger = createLogger("keeper:adl");
@@ -439,10 +439,9 @@ export class AdlService {
       // Admin-oracle or HYPERP mode: oracle account is the slab itself
       oracleKey = market.slabAddress;
     } else {
-      const feedHex = Array.from(feedBytes)
-        .map((b: number) => b.toString(16).padStart(2, "0"))
-        .join("");
-      oracleKey = derivePythPushOraclePDA(feedHex)[0];
+      // External feed → resolve Pyth vs Chainlink by account owner (Chainlink
+      // markets need index_feed_id, not a derived Pyth PDA).
+      oracleKey = await resolveExternalOracleAccount(pConfig.indexFeedId, connection);
     }
 
     let sent = 0;

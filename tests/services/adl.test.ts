@@ -32,7 +32,7 @@ vi.mock("@percolatorct/sdk", () => ({
 }));
 
 vi.mock("@percolatorct/shared", () => ({
-  getConnection: vi.fn(() => ({})),
+  getConnection: vi.fn(() => ({ getAccountInfo: vi.fn(async () => null) })),
   loadKeypair: vi.fn(() => ({
     publicKey: {
       toBase58: () => "keeperPubkey1111111111111111111111111111111",
@@ -262,12 +262,13 @@ describe("AdlService", () => {
       expect(callArgs[1][3]).toBe(slabKey);
     });
 
-    it("derives Pyth oracle PDA for non-zero indexFeedId", async () => {
+    it("derives Pyth oracle PDA for a non-zero indexFeedId whose feed account is not Chainlink-owned", async () => {
+      // getAccountInfo returns null (a Pyth feed id is not an account) → Pyth PDA.
       const nonZeroFeed = new Uint8Array(32);
       nonZeroFeed[0] = 0xab;
       vi.mocked(sdk.parseConfig).mockReturnValue(makeConfig({
         maxPnlCap: 500_000n,
-        indexFeedId: { toBytes: () => nonZeroFeed },
+        indexFeedId: { toBytes: () => nonZeroFeed, toBase58: () => "FeedNonZeroPyth111111111111111111111111111" },
       }) as any);
 
       await service.scanMarket(slabAddress, makeMarket() as any);
