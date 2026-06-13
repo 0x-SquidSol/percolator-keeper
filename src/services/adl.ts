@@ -604,7 +604,9 @@ export class AdlService {
   async scanAll(): Promise<{ scanned: number; triggered: number; txSent: number }> {
     if (!this._getMarkets) return { scanned: 0, triggered: 0, txSent: 0 };
 
-    const markets = this._getMarkets();
+    // H6: Snapshot the markets Map to avoid concurrent mutation during async iteration.
+    // CrankService.discover() can add/delete markets while this loop is running.
+    const markets = new Map(this._getMarkets());
     let scanned = 0;
     let triggered = 0;
     let txSent = 0;
