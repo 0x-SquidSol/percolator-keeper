@@ -54,7 +54,6 @@ interface JupiterResponse {
 
 export class OracleService {
   private priceHistory = new Map<string, PriceEntry[]>();
-  private lastPushTime = new Map<string, number>();
   private _nonAuthorityLogged = new Set<string>();
   private readonly rateLimitMs = parseInt(process.env.ORACLE_RATE_LIMIT_MS ?? "5000", 10);
   private readonly maxHistory = 100;
@@ -70,13 +69,20 @@ export class OracleService {
     { consecutive: number; alertSent: boolean }
   >();
   private static readonly SINGLE_SOURCE_ALERT_THRESHOLD = 10;
-  // M-4: Track when an external source (DexScreener or Jupiter) last returned a
-  // valid price for each slab. Used to cap the on-chain fallback duration so that
-  // a prolonged external outage causes the oracle to go stale rather than cycling
-  // the same on-chain price forever.
+  // Track when an external source (DexScreener or Jupiter) last returned a valid
+  // price for each slab. This is the single freshness signal read by
+  // getStaleMarkets(): a prolonged external outage (only cached/on-chain fallback
+  // prices, which never advance this clock) causes the market to age into
+  // staleness rather than cranking on a frozen price forever.
   private lastExternalPriceMs = new Map<string, number>();
 
-  constructor() {
+  /** Injectable clock — defaults to Date.now() in production; overridden in
+   *  tests so price freshness / staleness is deterministic without faking the
+   *  global Date around the async fetch path. */
+  private readonly now: () => number;
+
+  constructor(opts?: { now?: () => number }) {
+    this.now = opts?.now ?? (() => Date.now());
     // M5: DexScreener and Jupiter REST APIs return prices with NO publisher
     // signature and NO slot field. Cross-source validation (10% deviation) +
     // min-liquidity filter ($1000) + historical deviation cap (30%) mitigate
@@ -346,10 +352,10 @@ export class OracleService {
       if (history && history.length > 0) {
         const last = history[history.length - 1];
         // Reject stale cached prices (>60s) to prevent bad liquidations
-        if (Date.now() - last.timestamp > CACHED_PRICE_MAX_AGE_MS) {
+        if (this.now() - last.timestamp > CACHED_PRICE_MAX_AGE_MS) {
           logger.warn("Cached price is stale", {
             mint,
-            ageSeconds: Math.round((Date.now() - last.timestamp) / 1000),
+            ageSeconds: Math.round((this.now() - last.timestamp) / 1000),
             maxAgeSeconds: CACHED_PRICE_MAX_AGE_MS / 1000
           });
           return null;
@@ -382,11 +388,12 @@ export class OracleService {
       }
     }
 
-    const entry: PriceEntry = { priceE6, source, timestamp: Date.now() };
+    const entry: PriceEntry = { priceE6, source, timestamp: this.now() };
     this.recordPrice(slabAddress, entry);
     oraclePushCountTotal.inc({ mint, source });
-    // M-4: Record that an external source produced a valid price. This resets the
-    // fallback clock so the on-chain fallback cap counts from the last real fetch.
+    // Single freshness signal for getStaleMarkets(): record that an external
+    // source produced a valid price now. Cached/fallback returns above bail out
+    // before this line, so they never refresh the staleness clock.
     this.lastExternalPriceMs.set(slabAddress, entry.timestamp);
     return entry;
   }
@@ -413,7 +420,12 @@ export class OracleService {
           oldestKey = key;
         }
       }
-      if (oldestKey) this.priceHistory.delete(oldestKey);
+      if (oldestKey) {
+        this.priceHistory.delete(oldestKey);
+        // Keep lastExternalPriceMs lifetime identical to priceHistory so the
+        // freshness map can't leak entries for markets we no longer track.
+        this.lastExternalPriceMs.delete(oldestKey);
+      }
     }
   }
 
@@ -430,27 +442,21 @@ export class OracleService {
   }
 
   /**
-   * Returns slab addresses where the last successful price push
-   * was more than `thresholdMs` ago (or never pushed).
+   * Returns slab addresses whose last successful EXTERNAL price fetch was more
+   * than `thresholdMs` ago (or which have never had one). Freshness is sourced
+   * exclusively from lastExternalPriceMs, set in fetchPrice() on — and only on —
+   * a successful external fetch, so a market surviving on a cached/on-chain
+   * fallback price never advances the clock and correctly ages into staleness.
+   * This is the single source of truth; there is no separate push-time to drift.
    * Only considers markets that have at least one price history entry.
    */
-  /**
-   * Record a successful price push for a market. Called by CrankService when
-   * a price push is bundled into a crank transaction (bypassing pushPrice()).
-   * Without this, getStaleMarkets() would flag bundled-push markets as stale
-   * because lastPushTime is never updated.
-   */
-  recordPushTime(slabAddress: string): void {
-    this.lastPushTime.set(slabAddress, Date.now());
-  }
-
   getStaleMarkets(thresholdMs: number): string[] {
-    const now = Date.now();
+    const now = this.now();
     const stale: string[] = [];
     for (const [slabAddress] of this.priceHistory) {
-      const lastPush = this.lastPushTime.get(slabAddress) ?? 0;
-      const stalenessMs = lastPush === 0 ? Infinity : now - lastPush;
-      if (lastPush === 0 || stalenessMs > thresholdMs) {
+      const lastFresh = this.lastExternalPriceMs.get(slabAddress) ?? 0;
+      const stalenessMs = lastFresh === 0 ? Infinity : now - lastFresh;
+      if (stalenessMs > thresholdMs) {
         stale.push(slabAddress);
       }
       if (isFinite(stalenessMs)) {

@@ -639,52 +639,6 @@ describe('CrankService', () => {
       expect(state.successCount).toBe(1);
     });
 
-    it.skip('should call recordPushTime after successful bundled price push', async () => {
-      const slabAddress = 'MarketPushTime111111111111111111111111';
-      const KEEPER_KEY = '11111111111111111111111111111111';
-      const KEEPER_AUTH = 'KeeperAuth11111111111111111111111111111';
-
-      vi.mocked(shared.loadKeypair).mockReturnValue({
-        publicKey: {
-          toBase58: () => KEEPER_AUTH,
-          equals: (other: any) => other?.toBase58?.() === KEEPER_AUTH,
-        },
-        secretKey: new Uint8Array(64),
-      } as any);
-
-      const localCrank = new CrankService(mockOracleService);
-
-      const mockMarket = {
-        slabAddress: { toBase58: () => slabAddress },
-        programId: { toBase58: () => KEEPER_KEY },
-        config: {
-          collateralMint: { toBase58: () => 'MintPush1111111111111111111111111111111' },
-          oracleAuthority: {
-            toBase58: () => KEEPER_AUTH,
-            equals: (other: any) => other?.toBase58?.() === KEEPER_AUTH,
-          },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
-          authorityPriceE6: BigInt(1_000_000),
-        },
-        params: { maintenanceMarginBps: 500n },
-        header: { admin: { toBase58: () => 'AdminPush111111111111111111111111111111' } },
-      };
-
-      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
-      await localCrank.discover();
-
-      mockOracleService.fetchPrice = vi.fn().mockResolvedValue({ priceE6: BigInt(50_000_000), source: 'dexscreener', timestamp: Date.now() });
-      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-push-time', estimatedCost: 5000 } as any);
-
-      try {
-        const result = await localCrank.crankMarket(slabAddress);
-        expect(result).toBe(true);
-        expect(mockOracleService.recordPushTime).toHaveBeenCalledWith(slabAddress);
-      } finally {
-        localCrank.stop();
-      }
-    });
-
     // Post-Phase-G: the "foreign oracle" skip (admin-push oracle requiring the keeper
     // to be the oracle authority) was removed. A market with a non-zero oracle authority
     // and index_feed_id == 0 is a normal HYPERP market and must be cranked, not skipped.
