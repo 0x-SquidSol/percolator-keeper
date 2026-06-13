@@ -437,16 +437,18 @@ export class CrankService {
       }
       if (data) {
         const base58Re = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+        // M3: Validate each field independently — don't discard the entire row
+        // when only one field is invalid.
         for (const row of data) {
-          const pool = row.dex_pool_address ?? undefined;
-          const ca = row.mainnet_ca ?? undefined;
+          let pool = row.dex_pool_address ?? undefined;
+          let ca = row.mainnet_ca ?? undefined;
           if (pool && !base58Re.test(pool)) {
-            logger.warn("Invalid dex_pool_address from Supabase, ignoring", { slabAddress: row.slab_address, dexPoolAddress: pool });
-            continue;
+            logger.warn("Invalid dex_pool_address from Supabase, ignoring field", { slabAddress: row.slab_address, dexPoolAddress: pool });
+            pool = undefined;
           }
           if (ca && !base58Re.test(ca)) {
-            logger.warn("Invalid mainnet_ca from Supabase, ignoring", { slabAddress: row.slab_address, mainnetCA: ca });
-            continue;
+            logger.warn("Invalid mainnet_ca from Supabase, ignoring field", { slabAddress: row.slab_address, mainnetCA: ca });
+            ca = undefined;
           }
           dbMarkets.set(row.slab_address, {
             dexPoolAddress: pool,
