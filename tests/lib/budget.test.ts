@@ -32,6 +32,7 @@ describe("KeeperBudget — defaults", () => {
     expect(stats.config.maxSolPerHour).toBe(500_000_000);
     expect(stats.config.maxSolPerDay).toBe(3_000_000_000);
     expect(stats.config.maxTxPerCycle).toBe(60);
+    expect(stats.config.cycleWindowMs).toBe(30_000);
     expect(stats.config.txSuccessRateThreshold).toBe(0.7);
     expect(stats.halted).toBe(false);
   });
@@ -161,6 +162,93 @@ describe("KeeperBudget — cycle tx count cap", () => {
     }
     expect(b.canSpend(1, "crank")).toBe(false);
     expect(b.haltKind).toBe("cycle-tx-count-cap");
+  });
+});
+
+describe("KeeperBudget — per-cycle window auto-reset", () => {
+  // Regression for the CRITICAL self-halt: the per-cycle counters used to be
+  // reset only by beginCycle(), which had no production caller, so they
+  // accumulated for the whole process lifetime and permanently latched a halt.
+  // They now reset on a time window with no caller required.
+
+  it("resets cycle spend + tx count once the window elapses, without beginCycle()", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    // Spend 802 of the 1_000 cycle cap across 2 txs — no manual reset.
+    b.recordTx(800, "crank", "success");
+    b.recordTx(2, "crank", "success");
+    expect(b.getStats().cycleSpend).toBe(802);
+    expect(b.getStats().cycleTxCount).toBe(2);
+    // Pre-roll, another 500 would breach (802 + 500 > 1_000).
+    clock.advance(30_000); // window elapses
+    expect(b.canSpend(500, "crank")).toBe(true); // window rolled → counters cleared
+    b.recordTx(500, "crank", "success");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(500); // reset to 0, then this tx
+    expect(s.cycleTxCount).toBe(1);
+    expect(b.isHalted()).toBe(false);
+  });
+
+  it("does not reset until the full window has elapsed", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    b.recordTx(900, "crank", "success");
+    clock.advance(29_999); // just under the window
+    expect(b.getStats().cycleSpend).toBe(900); // not yet rolled
+    clock.advance(1); // now exactly at the boundary
+    expect(b.getStats().cycleSpend).toBe(0); // rolled
+  });
+
+  it("a genuine within-window burst still trips the cap and latches (brake intact)", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    for (let i = 0; i < 5; i++) b.recordTx(1, "crank", "success"); // maxTxPerCycle = 5
+    expect(b.canSpend(1, "crank")).toBe(false);
+    expect(b.haltKind).toBe("cycle-tx-count-cap");
+  });
+
+  it("window roll does NOT clear a latched halt — resume() is still required", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    for (let i = 0; i < 5; i++) b.recordTx(1, "crank", "success");
+    expect(b.canSpend(1, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(true);
+    clock.advance(120_000); // several windows elapse
+    expect(b.isHalted()).toBe(true); // a real breach stays halted until a human resumes
+    expect(b.canSpend(1, "crank")).toBe(false);
+    b.resume("op");
+    expect(b.canSpend(1, "crank")).toBe(true);
+  });
+});
+
+describe("KeeperBudget — onResume hook", () => {
+  it("fires when a halt is cleared and lets callers reset a halted gauge", () => {
+    const clock = makeClock();
+    const onResume = vi.fn();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, onResume });
+    b.haltManually("cordon");
+    expect(b.isHalted()).toBe(true);
+    b.resume("op");
+    expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire when resume() is a no-op on a non-halted budget", () => {
+    const clock = makeClock();
+    const onResume = vi.fn();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, onResume });
+    b.resume("op");
+    expect(onResume).not.toHaveBeenCalled();
+  });
+
+  it("onResume errors are caught and do not break resume()", () => {
+    const clock = makeClock();
+    const onResume = vi.fn(() => {
+      throw new Error("metric backend down");
+    });
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, onResume });
+    b.haltManually("cordon");
+    expect(() => b.resume("op")).not.toThrow();
+    expect(b.isHalted()).toBe(false);
   });
 });
 

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { Connection, TransactionInstruction, Keypair } from "@solana/web3.js";
-import { sendWithRetryKeeper, createLogger } from "@percolatorct/shared";
+import { sendWithRetryKeeper, createLogger, sendCriticalAlert } from "@percolatorct/shared";
 import type { KeeperSendOptions } from "@percolatorct/shared";
 import { KeeperBudget } from "./budget.js";
+import { budgetHalted } from "./metrics.js";
 import type { TxType, TxResult } from "./budget.js";
 import { HeliusPriorityFeeEstimator } from "./priority-fee.js";
 import type { PriorityFeeEstimator, PriorityFeeTier } from "./priority-fee.js";
@@ -50,7 +51,39 @@ function getCuEstimator(): CuEstimator {
   return _cuEstimator;
 }
 
-export const sharedBudget = new KeeperBudget();
+/**
+ * Process-wide budget circuit breaker. Wired with observability so a halt is
+ * never silent: onHalt sets the keeper_budget_halted gauge and pages on-call;
+ * onResume clears the gauge. Recovery from a latched halt is via the
+ * authenticated POST /admin/budget/resume endpoint (see index.ts).
+ */
+export const sharedBudget = new KeeperBudget(
+  {},
+  {
+    onHalt: (kind, reason) => {
+      budgetHalted.set(1);
+      logger.error("KeeperBudget circuit-breaker halted — refusing all sends until resume", {
+        kind,
+        reason,
+      });
+      // Page on-call. The budget wraps this hook in try/catch, so an alerting
+      // failure can never break the send path. Promise.resolve guards against
+      // a non-thenable return.
+      Promise.resolve(
+        sendCriticalAlert("Keeper budget circuit-breaker tripped — sends halted", [
+          { name: "Kind", value: kind, inline: true },
+          { name: "Reason", value: reason.slice(0, 200), inline: false },
+          {
+            name: "Recovery",
+            value: "Investigate the cause, then POST /admin/budget/resume (x-shared-secret).",
+            inline: false,
+          },
+        ]),
+      ).catch(() => {});
+    },
+    onResume: () => budgetHalted.set(0),
+  },
+);
 
 function isMainnetSender(): boolean {
   return (

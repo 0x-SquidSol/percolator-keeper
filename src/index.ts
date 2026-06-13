@@ -20,6 +20,7 @@ import { LeaderLock, makeIdentity } from "./lib/leader.js";
 import { captureAndExit } from "./lib/exit-handlers.js";
 import { StartupTracker } from "./lib/startup-tracker.js";
 import { sharedTxQueue, DRAIN_TIMEOUT_MS } from "./lib/tx-queue.js";
+import { sharedBudget } from "./lib/keeper-send.js";
 import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harness.js";
 import { sharedDecisionLog } from "./lib/decision-log.js";
 
@@ -428,6 +429,56 @@ res.writeHead(401, secureJsonHeaders);
     return;
   }
 
+  // POST /admin/budget/resume — clear a latched budget circuit-breaker halt
+  // without a full restart. Auth mirrors /register: x-shared-secret header
+  // matching KEEPER_REGISTER_SECRET, constant-time compare, per-IP rate limit.
+  if (req.url === "/admin/budget/resume" && req.method === "POST") {
+    const registerSecret = process.env.KEEPER_REGISTER_SECRET ?? "";
+    if (!registerSecret) {
+      req.resume();
+      res.writeHead(503, secureJsonHeaders);
+      res.end(JSON.stringify({ success: false, message: "Endpoint not configured" }));
+      return;
+    }
+
+    const clientIp = String(req.socket.remoteAddress ?? "unknown");
+    if (isRateLimited(clientIp)) {
+      logger.warn("Budget resume rate limited", { ip: clientIp });
+      req.resume();
+      res.writeHead(429, secureJsonHeaders);
+      res.end(JSON.stringify({ success: false, message: "Too many requests" }));
+      return;
+    }
+
+    const provided = String(req.headers["x-shared-secret"] ?? "");
+    const secretBuf = Buffer.from(registerSecret, "utf8");
+    const providedBuf = Buffer.from(provided, "utf8");
+    const maxLen = Math.max(secretBuf.length, providedBuf.length, 1);
+    const secretPad = Buffer.alloc(maxLen);
+    const providedPad = Buffer.alloc(maxLen);
+    secretBuf.copy(secretPad);
+    providedBuf.copy(providedPad);
+    const lengthMatch = secretBuf.length === providedBuf.length;
+    const contentMatch = timingSafeEqual(secretPad, providedPad);
+    if (!lengthMatch || !contentMatch) {
+      recordAuthFailure(clientIp);
+      req.resume();
+      res.writeHead(401, secureJsonHeaders);
+      res.end(JSON.stringify({ success: false, message: "Unauthorized" }));
+      return;
+    }
+
+    req.resume(); // drain the request body — we don't need it
+    const operator = String(req.headers["x-operator"] ?? `http:${clientIp}`);
+    const wasHalted = sharedBudget.isHalted();
+    const previousHaltKind = sharedBudget.haltKind ?? null;
+    sharedBudget.resume(operator);
+    logger.warn("Budget resume requested via endpoint", { operator, wasHalted, previousHaltKind });
+    res.writeHead(200, secureJsonHeaders);
+    res.end(JSON.stringify({ success: true, wasHalted, previousHaltKind, stats: sharedBudget.getStats() }));
+    return;
+  }
+
   if (req.url === "/health" && req.method === "GET") {
     // A5: hard 503 until start() resolved. Railway otherwise marks the
     // container healthy as soon as healthServer.listen() returns — long
@@ -544,6 +595,20 @@ res.writeHead(401, secureJsonHeaders);
       invariants: monitorService.getStatus(),
       // Task 1.8: Sender land-rate + tip-spend metrics for Phase 1 rollout observability
       senderMetrics: snapshotSenderMetrics(),
+      // Budget circuit-breaker state — surfaced so a latched halt is visible on
+      // dashboards without scraping /metrics. Recover via POST /admin/budget/resume.
+      budget: (() => {
+        const s = sharedBudget.getStats();
+        return {
+          halted: s.halted,
+          haltKind: s.haltKind ?? null,
+          cycleSpend: s.cycleSpend,
+          cycleTxCount: s.cycleTxCount,
+          hourSpend: s.hourSpend,
+          daySpend: s.daySpend,
+          txSuccessRate: s.txSuccessRate,
+        };
+      })(),
     };
     
     const currentRole = leaderLock ? leaderLock.role() : "leader";

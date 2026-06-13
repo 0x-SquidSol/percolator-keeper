@@ -32,6 +32,15 @@ export interface KeeperBudgetConfig {
   maxSolPerDay: number;
   /** Cap on tx attempts per cycle (default 60). */
   maxTxPerCycle: number;
+  /**
+   * Length of the per-cycle window in ms (default 30_000, matching the default
+   * crank interval). The per-cycle caps (maxSolPerCycle / maxTxPerCycle) are a
+   * burst limiter scoped to this rolling window: the counters reset
+   * automatically once the window elapses, so no external beginCycle() caller
+   * is required. Operators running many markets or a longer crank interval
+   * should size maxTxPerCycle / cycleWindowMs to their peak sends-per-window.
+   */
+  cycleWindowMs: number;
   /** Window length in ms over which success rate is computed (default 60_000). */
   txSuccessRateWindow: number;
   /** Floor for success rate within the window (default 0.70). */
@@ -65,6 +74,9 @@ export interface KeeperBudgetDeps {
   now?: () => number;
   env?: NodeJS.ProcessEnv;
   onHalt?: (kind: HaltKind, reason: string) => void;
+  /** Fired when a latched halt is cleared (resume()). Lets callers reset a
+   *  halted gauge without coupling this class to the metrics layer. */
+  onResume?: () => void;
 }
 
 interface SpendEvent {
@@ -82,6 +94,7 @@ const DEFAULTS: KeeperBudgetConfig = {
   maxSolPerHour: 500_000_000,
   maxSolPerDay: 3_000_000_000,
   maxTxPerCycle: 60,
+  cycleWindowMs: 30_000,
   txSuccessRateWindow: 60_000,
   txSuccessRateThreshold: 0.7,
   txSuccessRateMinSamples: 10,
@@ -95,6 +108,7 @@ const INT_ENV_KEYS: Array<[keyof KeeperBudgetConfig, string]> = [
   ["maxSolPerHour", "KEEPER_MAX_SOL_PER_HOUR"],
   ["maxSolPerDay", "KEEPER_MAX_SOL_PER_DAY"],
   ["maxTxPerCycle", "KEEPER_MAX_TX_PER_CYCLE"],
+  ["cycleWindowMs", "KEEPER_CYCLE_WINDOW_MS"],
   ["txSuccessRateWindow", "KEEPER_TX_SUCCESS_RATE_WINDOW_MS"],
   ["txSuccessRateMinSamples", "KEEPER_TX_SUCCESS_RATE_MIN_SAMPLES"],
 ];
@@ -123,9 +137,14 @@ export class KeeperBudget {
   readonly config: KeeperBudgetConfig;
   private readonly _now: () => number;
   private readonly _onHalt: ((kind: HaltKind, reason: string) => void) | undefined;
+  private readonly _onResume: (() => void) | undefined;
 
   private _cycleSpend = 0;
   private _cycleTxCount = 0;
+  /** Wall-clock anchor for the current per-cycle window. 0 = not yet anchored
+   *  (anchored lazily on first send-path call so the window starts at first
+   *  use, not at construction time). */
+  private _cycleStartMs = 0;
   private readonly _hourEvents: SpendEvent[] = [];
   private _hourSpendSum = 0;
   private readonly _dayEvents: SpendEvent[] = [];
@@ -143,6 +162,7 @@ export class KeeperBudget {
     this.config = { ...DEFAULTS, ...envOverrides, ...config };
     this._now = deps.now ?? (() => Date.now());
     this._onHalt = deps.onHalt;
+    this._onResume = deps.onResume;
   }
 
   /**
@@ -157,6 +177,7 @@ export class KeeperBudget {
     if (this._isHalted) return false;
 
     const nowMs = this._now();
+    this._rollCycleIfElapsed(nowMs);
     this._pruneOld(nowMs);
 
     if (this._cycleSpend + lamports > this.config.maxSolPerCycle) {
@@ -212,6 +233,8 @@ export class KeeperBudget {
   recordTx(lamports: number, txType: string, result: TxResult): void {
     if (lamports < 0 || !Number.isFinite(lamports)) return;
     const nowMs = this._now();
+    // Roll before counting so this tx lands in the current window.
+    this._rollCycleIfElapsed(nowMs);
     this._cycleTxCount++;
 
     if (result !== "drop") {
@@ -241,16 +264,22 @@ export class KeeperBudget {
   }
 
   /**
-   * Reset per-cycle counters at the top of a new cycle. Does NOT clear halt
+   * Manually reset per-cycle counters and re-anchor the per-cycle window.
+   * No longer required for correctness — the per-cycle window now resets
+   * itself on a timer (see _rollCycleIfElapsed) so the caps work without any
+   * caller. Retained for explicit manual cordoning/tests. Does NOT clear halt
    * state — that requires resume().
    */
   beginCycle(): void {
     this._cycleSpend = 0;
     this._cycleTxCount = 0;
+    this._cycleStartMs = this._now();
   }
 
   getStats(): BudgetStats {
-    this._pruneOld(this._now());
+    const nowMs = this._now();
+    this._rollCycleIfElapsed(nowMs);
+    this._pruneOld(nowMs);
     return {
       cycleSpend: this._cycleSpend,
       hourSpend: this._hourSpendSum,
@@ -292,6 +321,13 @@ export class KeeperBudget {
     this._isHalted = false;
     this._haltKind = undefined;
     this._haltReason = undefined;
+    try {
+      this._onResume?.();
+    } catch (err) {
+      logger.warn("onResume hook threw — ignoring", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**
@@ -317,6 +353,36 @@ export class KeeperBudget {
       logger.warn("onHalt hook threw — ignoring", {
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+  }
+
+  /**
+   * Reset the per-cycle counters when the cycle window has elapsed. This is the
+   * reset that beginCycle() was supposed to provide but that no production
+   * caller ever invoked, which made the per-cycle caps accumulate over the whole
+   * process lifetime and permanently self-halt the keeper.
+   *
+   * Time-driven on purpose: the budget is a single shared singleton hit by the
+   * crank, liquidation, and ADL services on independent timers. If each service
+   * reset the counters at the top of its own loop they would stomp one another
+   * (multi-owner race). Anchoring the reset to wall-clock time means no service
+   * owns it — any send-path call crossing the window boundary rolls it
+   * identically, race-free under Node's single-threaded event loop.
+   *
+   * It deliberately does NOT clear a latched halt: a breach within a single
+   * window is a genuine burst anomaly that must stay halted until an operator
+   * resume()s (see resume() / the /admin/budget/resume endpoint). Only the
+   * lifetime-accumulation that caused the self-halt is removed.
+   */
+  private _rollCycleIfElapsed(nowMs: number): void {
+    if (this._cycleStartMs === 0) {
+      this._cycleStartMs = nowMs;
+      return;
+    }
+    if (nowMs - this._cycleStartMs >= this.config.cycleWindowMs) {
+      this._cycleSpend = 0;
+      this._cycleTxCount = 0;
+      this._cycleStartMs = nowMs;
     }
   }
 
