@@ -38,95 +38,99 @@ vi.mock('@percolatorct/shared', () => ({
     if (err instanceof Error) return err.message;
     return String(err);
   }),
+  sendWarningAlert: vi.fn(() => Promise.resolve()),
 }));
 
 import { OracleService } from '../../src/services/oracle.js';
 
+/**
+ * Staleness is now measured from the last successful EXTERNAL price fetch
+ * (lastExternalPriceMs), set by fetchPrice(). These tests use an injected clock
+ * so "becomes stale after N minutes" is deterministic, and assert the corrected
+ * behavior: a freshly-fetched market is NOT stale; a market with no fresh fetch
+ * for longer than the threshold IS stale.
+ */
 describe('OracleService.getStaleMarkets', () => {
+  let clock: number;
   let oracle: OracleService;
 
+  // URL-based fetch mock: both sources return $1.00 for any mint. Routing on the
+  // URL (rather than a mockResolvedValueOnce queue) keeps the mock robust against
+  // the module-level DexScreener cache, which can serve a repeated mint without a
+  // fetch call and would otherwise desync an ordered once-queue.
   beforeEach(() => {
     vi.clearAllMocks();
-    oracle = new OracleService();
+    clock = 1_700_000_000_000;
+    oracle = new OracleService({ now: () => clock });
+    vi.mocked(fetch).mockImplementation(async (input: any) => {
+      const url = String(input);
+      if (url.includes('dexscreener')) {
+        return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }) } as any;
+      }
+      const mint = decodeURIComponent(url.split('ids=')[1] ?? '');
+      return { ok: true, json: async () => ({ data: { [mint]: { price: '1.00' } } }) } as any;
+    });
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
+  /** Seed a fresh, cross-validated external price for `slab` via fetchPrice. */
+  async function seedFreshPrice(mint: string, slab: string) {
+    await oracle.fetchPrice(mint, slab);
+  }
+
   it('should return empty array when no markets are tracked', () => {
-    const stale = oracle.getStaleMarkets(5 * 60 * 1000);
-    expect(stale).toEqual([]);
+    expect(oracle.getStaleMarkets(5 * 60 * 1000)).toEqual([]);
   });
 
-  it('should return markets that have price history but no push', async () => {
-    // Seed price history via fetchPrice (no pushPrice call → lastPushTime stays 0)
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }),
-      } as any)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ data: { MINT_A: { price: '1.00' } } }),
-      } as any);
-
-    await oracle.fetchPrice('MINT_A', 'SLAB_A');
-
-    const stale = oracle.getStaleMarkets(5 * 60 * 1000);
-    expect(stale).toContain('SLAB_A');
+  it('does NOT flag a market whose price was just fetched', async () => {
+    await seedFreshPrice('MINT_A', 'SLAB_A');
+    expect(oracle.getStaleMarkets(10 * 60 * 1000)).not.toContain('SLAB_A');
+    expect(oracle.getStaleMarkets(5 * 60 * 1000)).not.toContain('SLAB_A');
   });
 
-  // "should not return markets with recent push" test removed — pushPrice
-  // was deleted in Phase G. The getStaleMarkets logic now depends on
-  // recordPushTime calls from external oracle sources instead.
-
-  it('should distinguish between 5min alert and 10min pause thresholds', async () => {
-    // We'll test the logic by checking that the same market appears
-    // at a short threshold but not at a long one
-
-    // Seed market with price history but no push
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ pairs: [{ priceUsd: '2.00', liquidity: { usd: 100000 } }] }),
-      } as any)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ data: { MINT_C: { price: '2.00' } } }),
-      } as any);
-
-    await oracle.fetchPrice('MINT_C', 'SLAB_C');
-
-    // With threshold=0, everything with no push is stale
-    const staleAt0 = oracle.getStaleMarkets(0);
-    expect(staleAt0).toContain('SLAB_C');
-
-    // With a very large threshold (1 hour), a never-pushed market is still stale
-    // because lastPushTime=0 means now - 0 > threshold for any threshold
-    const staleAtHour = oracle.getStaleMarkets(60 * 60 * 1000);
-    expect(staleAtHour).toContain('SLAB_C');
+  it('flags a market once its last fresh fetch is older than the threshold', async () => {
+    await seedFreshPrice('MINT_A', 'SLAB_A'); // fresh at t0
+    clock += 11 * 60 * 1000; // 11 minutes later
+    expect(oracle.getStaleMarkets(10 * 60 * 1000)).toContain('SLAB_A');
   });
 
-  it('should return multiple stale markets', async () => {
-    // Seed two markets
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }),
-      } as any)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ data: { MINT_X: { price: '1.00' } } }),
-      } as any);
-    await oracle.fetchPrice('MINT_X', 'SLAB_X');
+  it('distinguishes the 5-min alert threshold from the 10-min pause threshold', async () => {
+    await seedFreshPrice('MINT_C', 'SLAB_C'); // fresh at t0
+    clock += 6 * 60 * 1000; // 6 minutes later
 
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ pairs: [{ priceUsd: '3.00', liquidity: { usd: 50000 } }] }),
-      } as any)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ data: { MINT_Y: { price: '3.00' } } }),
-      } as any);
-    await oracle.fetchPrice('MINT_Y', 'SLAB_Y');
+    // Older than the 5-min alert threshold...
+    expect(oracle.getStaleMarkets(5 * 60 * 1000)).toContain('SLAB_C');
+    // ...but younger than the 10-min pause threshold.
+    expect(oracle.getStaleMarkets(10 * 60 * 1000)).not.toContain('SLAB_C');
+  });
 
-    const stale = oracle.getStaleMarkets(5 * 60 * 1000);
-    expect(stale).toContain('SLAB_X');
-    expect(stale).toContain('SLAB_Y');
-    expect(stale.length).toBe(2);
+  it('recovers a market on a fresh fetch (unpause path)', async () => {
+    await seedFreshPrice('MINT_E', 'SLAB_E');
+    clock += 11 * 60 * 1000;
+    expect(oracle.getStaleMarkets(10 * 60 * 1000)).toContain('SLAB_E'); // stale
+
+    await seedFreshPrice('MINT_E', 'SLAB_E'); // fresh again at the advanced clock
+    expect(oracle.getStaleMarkets(10 * 60 * 1000)).not.toContain('SLAB_E'); // recovered
+  });
+
+  it('reports multiple stale markets and only the stale ones', async () => {
+    await seedFreshPrice('MINT_X', 'SLAB_X');
+    await seedFreshPrice('MINT_Y', 'SLAB_Y');
+    clock += 11 * 60 * 1000; // both stale now
+
+    const allStale = oracle.getStaleMarkets(10 * 60 * 1000);
+    expect(allStale).toContain('SLAB_X');
+    expect(allStale).toContain('SLAB_Y');
+    expect(allStale.length).toBe(2);
+
+    // Refresh only X — Y stays stale.
+    await seedFreshPrice('MINT_X', 'SLAB_X');
+    const stillStale = oracle.getStaleMarkets(10 * 60 * 1000);
+    expect(stillStale).not.toContain('SLAB_X');
+    expect(stillStale).toContain('SLAB_Y');
+    expect(stillStale.length).toBe(1);
   });
 });
