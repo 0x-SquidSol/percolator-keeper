@@ -24,6 +24,7 @@ import {
   solSpentLamportsTotal,
   cycleDurationSeconds,
   txLandTimeSeconds,
+  liquidationSkippedDustTotal,
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
@@ -87,6 +88,47 @@ async function fetchSlabWithRetry(
 // BL2: Extract magic numbers to named constants
 const PRICE_E6_DIVISOR = 1_000_000n; // Price precision divisor (6 decimals)
 const BPS_MULTIPLIER = 10_000n; // Basis points multiplier (100% = 10000 bps)
+
+// Minimum position notional below which the keeper will NOT liquidate.
+//
+// `notional = abs(positionSize) * priceE6 / PRICE_E6_DIVISOR`. Because POS_SCALE
+// is a fixed 1e6 (program spec) and priceE6 is a USD price scaled by 1e6, the
+// resulting notional is denominated in a fixed 6-decimal USD quote unit
+// (1_000_000n == $1) for EVERY market — it does not depend on the collateral
+// mint's token decimals (SOL/BTC/ETH collateral all reduce to the same USD
+// quote). So a single USD-denominated floor is correct across all markets.
+//
+// Why a floor: the keeper liquidates as a permissionless cranker and earns NO
+// liquidation fee (the on-chain penalty goes to the protocol, not the keeper),
+// so every liquidation is a pure cost — a crank+LiquidateAtOracle tx that on
+// mainnet pays a Jito tip (default 200_000 lamports) plus fees. Without a floor,
+// the keeper spends real SOL liquidating dust worth less than the fee, and —
+// since the program allows dust deposits — an attacker can spam tiny
+// undercollateralized positions across many owner accounts (bypassing
+// MAX_LIQ_PER_OWNER_PER_CYCLE) to drain the wallet up to the budget caps.
+//
+// Default $1 (1_000_000n): ~10-20x the per-liquidation fee, well below any
+// economically meaningful position. Tunable via KEEPER_MIN_LIQ_NOTIONAL (raw
+// 6-decimal-USD units); set to 0 to disable.
+const DEFAULT_MIN_LIQ_NOTIONAL = 1_000_000n; // $1 in 6-decimal USD units
+
+/** Parse KEEPER_MIN_LIQ_NOTIONAL (a non-negative integer, raw 6-dec USD units).
+ *  Falls back to the default on missing/invalid input. Exported for testing. */
+export function parseMinLiqNotional(raw: string | undefined): bigint {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_MIN_LIQ_NOTIONAL;
+  try {
+    const n = BigInt(raw.trim());
+    return n >= 0n ? n : DEFAULT_MIN_LIQ_NOTIONAL;
+  } catch {
+    logger.warn("Invalid KEEPER_MIN_LIQ_NOTIONAL — using default", {
+      raw,
+      default: DEFAULT_MIN_LIQ_NOTIONAL.toString(),
+    });
+    return DEFAULT_MIN_LIQ_NOTIONAL;
+  }
+}
+
+const MIN_LIQUIDATION_NOTIONAL: bigint = parseMinLiqNotional(process.env.KEEPER_MIN_LIQ_NOTIONAL);
 
 /**
  * A.13: pure helper for margin-ratio-in-bps. scanMarket() and liquidate()
@@ -309,6 +351,20 @@ export class LiquidationService {
           const notional = absBI(account.positionSize) * price / PRICE_E6_DIVISOR;
           if (notional === 0n) continue;
 
+          // Min-notional floor: skip sub-floor dust — the keeper earns no
+          // liquidation fee, so liquidating value below the tx fee is a pure
+          // loss and an attacker-spammable drain. (notional is 6-decimal USD.)
+          if (notional < MIN_LIQUIDATION_NOTIONAL) {
+            liquidationSkippedDustTotal.inc({ stage: "scan" });
+            logger.debug("Skipping dust-notional candidate (below min-notional floor)", {
+              slabAddress,
+              accountIdx: i,
+              notional: notional.toString(),
+              floor: MIN_LIQUIDATION_NOTIONAL.toString(),
+            });
+            continue;
+          }
+
           // v12.17: entryPrice is always 0n (removed from on-chain struct).
           // Use account.pnl directly — it is always populated and accurate.
           const markPnl = account.pnl;
@@ -453,6 +509,22 @@ export class LiquidationService {
         }
 
         const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
+
+        // Min-notional floor (mirrors scanMarket): a position can shrink below
+        // the floor between scan and submit (partial fill, owner partial-close,
+        // price move), and the event-driven path reaches liquidate() without
+        // scanAndLiquidateAll. Re-check before paying a fee on dust.
+        if (notional < MIN_LIQUIDATION_NOTIONAL) {
+          liquidationSkippedDustTotal.inc({ stage: "presubmit" });
+          logger.warn("Pre-submit: notional below min-notional floor, aborting", {
+            accountIndex: accountIdx,
+            slabAddress: slabAddress.toBase58(),
+            notional: notional.toString(),
+            floor: MIN_LIQUIDATION_NOTIONAL.toString(),
+          });
+          return null;
+        }
+
         // A.13: shared helper. equity<=0n returns 0n, which is < any
         // positive maintenanceMarginBps and so correctly proceeds with
         // liquidation; the previous `if (equity > 0n)` wrapper just

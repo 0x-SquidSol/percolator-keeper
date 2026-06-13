@@ -26,6 +26,13 @@ export const solSpentLamportsTotal = new Counter({
   registers: [registry],
 });
 
+export const liquidationSkippedDustTotal = new Counter({
+  name: "keeper_liquidation_skipped_dust_total",
+  help: "Liquidation candidates skipped for being below the min-notional floor, partitioned by stage (scan|presubmit)",
+  labelNames: ["stage"] as const,
+  registers: [registry],
+});
+
 export const jitoBundleFailCountTotal = new Counter({
   name: "keeper_jito_bundle_fail_count_total",
   help: "Total number of Jito bundle submission failures",
