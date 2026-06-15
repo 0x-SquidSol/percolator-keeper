@@ -1,4 +1,4 @@
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, SystemProgram, Keypair } from "@solana/web3.js";
 import type { Connection, TransactionInstruction } from "@solana/web3.js";
 import {
   discoverMarkets,
@@ -112,13 +112,29 @@ function toBase58Memcmp(bytes: Uint8Array): string {
 function wrapperConfigV17ToMarketConfig(cfg: ReturnType<typeof parseWrapperConfigV17>): DiscoveredMarket["config"] {
   const zeroKey = PublicKey.default;
   const oracleMode = cfg.oracleMode;
-  // In v17 oracle modes: 0=PythPinned, 1=AdminOracle, 2=HybridAfterHours
-  // For PythPinned (mode=0): oracleAuthority is all-zeros, indexFeedId = first oracle leg feed
-  // For AdminOracle (mode=1): oracleAuthority = marketauth, indexFeedId = all-zeros
-  // We map to the legacy MarketConfig oracle fields so downstream oracle resolution still works.
-  const isAdminOracle = oracleMode === 1 || oracleMode === 2;
+  // Program enum (v16_program.rs:75-78):
+  //   MANUAL=0, HYBRID_AFTER_HOURS=1, EWMA_MARK=2, AUTH_MARK=3
+  //
+  // Only AUTH_MARK(3) is keeper-authority-gated (the keeper must push prices via
+  // RestartAssetOracle / UpdateAuthMark). EWMA_MARK(2) uses the stored mark_ewma_e6
+  // and is also keeper-authority-gated for price pushes but PermissionlessCrank is
+  // permissionless for it. HYBRID_AFTER_HOURS(1) reads external Pyth accounts from
+  // the crank account-tail — PermissionlessCrank is permissionless and does NOT
+  // require the keeper to be the oracle authority.
+  //
+  // Bug fix: previous code set isAdminOracle=true for modes 1 and 2, which caused
+  // HYBRID_AFTER_HOURS(1) markets to get oracleAuthority=marketauth and be skipped
+  // by the foreign-oracle guard in crankAll (crank.ts:1511). Correct mapping:
+  //   - AUTH_MARK(3): isAdminOracle=true, oracleAuthority=marketauth, indexFeedId=zero
+  //   - EWMA_MARK(2): isAdminOracle=false for skip-guard; oracleAuthority=zero (no ext key)
+  //   - HYBRID_AFTER_HOURS(1): isAdminOracle=false; indexFeedId=oracleLegFeeds[0] so
+  //       resolveOracleKey derives the correct Pyth push-oracle PDA
+  //   - MANUAL(0): isAdminOracle=false; indexFeedId=zero (slab placeholder used)
+  const isAdminOracle = oracleMode === 3; // AUTH_MARK only
   const oracleAuthority = isAdminOracle ? cfg.marketauth : zeroKey;
-  const indexFeedId = (!isAdminOracle && cfg.oracleLegFeeds.length > 0)
+  // HYBRID_AFTER_HOURS uses oracle_leg_feeds for the external Pyth price source.
+  // Set indexFeedId so resolveOracleKey can derive the Pyth push-oracle PDA.
+  const indexFeedId = (oracleMode === 1 && cfg.oracleLegFeeds.length > 0)
     ? cfg.oracleLegFeeds[0]!
     : zeroKey;
 
@@ -258,14 +274,17 @@ async function discoverV17Markets(
         marketCreatedSlot: 0n, resolvedSlot: 0n,
       };
 
-      markets.push({
+      const market: DiscoveredMarket & { _rawV17Config?: ReturnType<typeof parseWrapperConfigV17> } = {
         slabAddress: pubkey,
         programId,
         header: stubHeader as never,
         config: marketConfig,
         engine: stubEngine as never,
         params: stubParams as never,
-      });
+      };
+      // Attach raw v17 config for multi-leg HYBRID_AFTER_HOURS oracle tail construction.
+      market._rawV17Config = wrapperCfg;
+      markets.push(market);
     } catch (err) {
       logger.debug("discoverV17Markets: failed to parse account", {
         pubkey: pubkey.toBase58().slice(0, 8),
@@ -315,13 +334,15 @@ function parseMarketFromAccountData(
         adlFillCapBps: 0n, minPositionSize: 0n,
       };
       const stubHeader = { magic: 0n, version: 16, kind: 1, marketCreatedSlot: 0n, resolvedSlot: 0n };
-      return {
+      const market: DiscoveredMarket & { _rawV17Config?: ReturnType<typeof parseWrapperConfigV17> } = {
         slabAddress: pubkey, programId,
         header: stubHeader as never,
         config: marketConfig,
         engine: stubEngine as never,
         params: stubParams as never,
       };
+      market._rawV17Config = wrapperCfg;
+      return market;
     }
     // Legacy v12.x slab
     const header = parseHeader(data);
@@ -417,25 +438,111 @@ async function provisionKeeperPortfolio(
     return null;
   }
 
-  // No portfolio found — we need to create one via InitPortfolio (tag 1).
-  // InitPortfolio requires 3 accounts: [owner(s,w), market(w), portfolio(w)]
-  // The portfolio account must be pre-allocated. In v17, the program calls
-  // portfolio_ai.realloc(required_portfolio_len, true) if too small — but the
-  // account must exist before the instruction (Solana requires the account to be
-  // created via system program CPI or pre-allocated with rent).
+  // No portfolio found — create one via SystemProgram.createAccount + InitPortfolio (tag 1).
   //
-  // For devnet bring-up we log a warning and return null. The caller (discover())
-  // already handles null by counting as skippedNoPortfolio. A full provisioning
-  // flow (createAccount + initPortfolio) requires the keeper to have sufficient
-  // SOL and involves two instructions in one transaction; that is left as a
-  // follow-on Phase 6 devnet task.
-  logger.info("Keeper portfolio not found for market — skipping provisioning (devnet bring-up: create manually)", {
-    market: marketKeyBase58.slice(0, 8),
-    keeperPublicKey: keeperKeyBase58.slice(0, 8),
-    programId: programId.toBase58().slice(0, 8),
-    hint: "Run: solana-keeper-init-portfolio --market <MARKET> --keeper <KEYPAIR>",
-  });
-  return null;
+  // Account layout for InitPortfolio (v16_program.rs:6437-6442):
+  //   [0] owner (signer, writable)
+  //   [1] market (writable)
+  //   [2] portfolio (writable, program-owned)
+  //
+  // The portfolio account must be pre-funded for FULL V17_PORTFOLIO_ACCOUNT_LEN (9347) bytes:
+  // v16_program.rs:6457 calls realloc ONLY IF data_len < required — it does NOT add lamports,
+  // so the account must already hold rent for the full size (9347). Create via SystemProgram.
+  //
+  // The market must be in Live mode (v16_program.rs:6450) for InitPortfolio to succeed.
+  // AlreadyInitialized (v16_program.rs:6445) is treated as success (concurrent provision race).
+  const portfolioKeypair = Keypair.generate();
+  const inFlightKey = `provision:${marketKeyBase58}`;
+
+  // Guard: if another async context is already provisioning this market, bail out.
+  if ((provisionKeeperPortfolio as unknown as { _inflight?: Set<string> })._inflight?.has(inFlightKey)) {
+    logger.debug("provisionKeeperPortfolio: in-flight for market, skipping duplicate provision", {
+      market: marketKeyBase58.slice(0, 8),
+    });
+    return null;
+  }
+  const inFlight = (provisionKeeperPortfolio as unknown as { _inflight?: Set<string> })._inflight ??
+    ((provisionKeeperPortfolio as unknown as { _inflight?: Set<string> })._inflight = new Set<string>());
+  inFlight.add(inFlightKey);
+
+  try {
+    const rentLamports = await connection.getMinimumBalanceForRentExemption(V17_PORTFOLIO_ACCOUNT_LEN);
+
+    const createAccountIx = SystemProgram.createAccount({
+      fromPubkey: keeperPublicKey,
+      newAccountPubkey: portfolioKeypair.publicKey,
+      lamports: rentLamports,
+      space: V17_PORTFOLIO_ACCOUNT_LEN,
+      programId,
+    });
+
+    const initPortfolioData = encodeInitUser();
+    const initPortfolioIx = buildIx({
+      programId,
+      keys: [
+        { pubkey: keeperPublicKey,           isSigner: true,  isWritable: true  },
+        { pubkey: marketPubkey,              isSigner: false, isWritable: true  },
+        { pubkey: portfolioKeypair.publicKey, isSigner: false, isWritable: true  },
+      ],
+      data: initPortfolioData,
+    });
+
+    const sendResult = await sharedTxQueue.enqueue("crank", () =>
+      keeperSend(connection, [createAccountIx, initPortfolioIx], [keypair, portfolioKeypair], "crank", sharedBudget, 3, {
+        skipPreflight: false,
+        multiRpcBroadcast: false,
+        simulateForCU: false,
+      }),
+    );
+
+    if (!sendResult) {
+      logger.warn("provisionKeeperPortfolio: send returned null", {
+        market: marketKeyBase58.slice(0, 8),
+      });
+      return null;
+    }
+
+    logger.info("Keeper portfolio provisioned via InitPortfolio", {
+      market: marketKeyBase58.slice(0, 8),
+      portfolio: portfolioKeypair.publicKey.toBase58().slice(0, 8),
+      signature: sendResult.signature,
+    });
+    return portfolioKeypair.publicKey;
+  } catch (provisionErr) {
+    const errMsg = provisionErr instanceof Error ? provisionErr.message : String(provisionErr);
+    // AlreadyInitialized: a concurrent provision beat us; re-query for the existing portfolio.
+    if (errMsg.includes("AlreadyInitialized") || errMsg.includes("custom program error: 0x0")) {
+      logger.info("provisionKeeperPortfolio: AlreadyInitialized — re-querying for existing portfolio", {
+        market: marketKeyBase58.slice(0, 8),
+      });
+      try {
+        const existing2 = await withTimeout(
+          connection.getProgramAccounts(programId, {
+            filters: [
+              { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+              { memcmp: { offset: V17_PORTFOLIO_MARKET_GROUP_MEMCMP_OFFSET, bytes: marketKeyBase58 } },
+              { memcmp: { offset: V17_PORTFOLIO_OWNER_MEMCMP_OFFSET, bytes: keeperKeyBase58 } },
+            ],
+          }),
+          RPC_TIMEOUT_MS,
+          "provisionKeeperPortfolio:requery",
+        );
+        if (existing2.length > 0 && existing2[0]) {
+          return existing2[0].pubkey;
+        }
+      } catch {
+        // ignore — fall through to null
+      }
+    } else {
+      logger.warn("provisionKeeperPortfolio: InitPortfolio failed", {
+        market: marketKeyBase58.slice(0, 8),
+        error: errMsg.slice(0, 200),
+      });
+    }
+    return null;
+  } finally {
+    inFlight.delete(inFlightKey);
+  }
 }
 
 /**
@@ -1148,10 +1255,11 @@ export class CrankService {
    *
    * v17 layout: [owner(s,w), market(w), portfolio(w), ...oracleTail(r)]
    *
-   * The oracle tail contains the resolved oracle account for the asset.
-   * For Pyth-pinned markets this is the Pyth PriceUpdateV2 PDA.
-   * For admin-oracle and zero-feed markets the slab itself is used as a
-   * placeholder (the on-chain crank path reads authority_price_e6 directly).
+   * The oracle tail (account_tail) contains one oracle account per leg, in order
+   * (hybrid_effective_price_for_crank_view @v16.rs:13522 reads oracle_accounts[0..count]).
+   * For HYBRID_AFTER_HOURS (mode=1) with oracle_leg_count>1, ALL legs must be appended
+   * in order so the program can read each leg's price.
+   * For MANUAL/EWMA_MARK/AUTH_MARK the single oracleKey (slab placeholder) is used.
    */
   private buildPermissionlessCrankKeys(
     owner: PublicKey,
@@ -1159,12 +1267,35 @@ export class CrankService {
     portfolio: PublicKey,
     oracleKey: PublicKey,
   ): { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] {
-    return [
+    const fixed: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [
       { pubkey: owner,                isSigner: true,  isWritable: true  },
       { pubkey: market.slabAddress,   isSigner: false, isWritable: true  },
       { pubkey: portfolio,            isSigner: false, isWritable: true  },
-      { pubkey: oracleKey,            isSigner: false, isWritable: false },
     ];
+
+    // For HYBRID_AFTER_HOURS (oracle_mode=1) with multiple oracle legs, derive a Pyth
+    // push-oracle PDA for each leg feed and append them all in order.
+    // oracle_leg_count is available via the raw config; fall back to single oracleKey
+    // for all other modes (MANUAL=0, EWMA_MARK=2, AUTH_MARK=3).
+    const rawCfg = (market as unknown as { _rawV17Config?: ReturnType<typeof parseWrapperConfigV17> })._rawV17Config;
+    if (rawCfg && rawCfg.oracleMode === 1 && rawCfg.oracleLegCount > 1) {
+      for (let i = 0; i < rawCfg.oracleLegCount; i++) {
+        const feed = rawCfg.oracleLegFeeds[i];
+        if (feed) {
+          const feedHex = Array.from(feed.toBytes())
+            .map((b: number) => b.toString(16).padStart(2, "0"))
+            .join("");
+          const [legOracle] = derivePythPushOraclePDA(feedHex);
+          fixed.push({ pubkey: legOracle, isSigner: false, isWritable: false });
+        } else {
+          fixed.push({ pubkey: oracleKey, isSigner: false, isWritable: false });
+        }
+      }
+    } else {
+      fixed.push({ pubkey: oracleKey, isSigner: false, isWritable: false });
+    }
+
+    return fixed;
   }
 
   /** Check if a market is due for cranking based on activity */
