@@ -354,6 +354,7 @@ describe('CrankService', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
+      setKeeperPortfolios(crankService); // v17: must provision portfolio before crankMarket runs
 
       // Anchor time. A fresh market has lastCrankTime=0 (never cranked).
       const t0 = 1_700_000_000_000;
@@ -772,27 +773,30 @@ describe('CrankService', () => {
       expect(state.successCount).toBe(1);
     });
 
-    // Post-Phase-G: the "foreign oracle" skip (admin-push oracle requiring the keeper
-    // to be the oracle authority) was removed. A market with a non-zero oracle authority
-    // and index_feed_id == 0 is a normal HYPERP market and must be cranked, not skipped.
-    // (The two prior tests that asserted the skip behavior were deleted with this change.)
-    it('Post-Phase-G: a market with a non-zero (foreign) oracle authority is cranked as HYPERP, not skipped', async () => {
+    // v17 behaviour (diverges from main Post-Phase-G):
+    // In main, Phase-G removed the foreign-oracle skip so admin-oracle markets are always
+    // cranked regardless of the keeper's authority match. In v17 we deliberately KEEP the
+    // skip: admin-oracle markets where keeper != oracleAuthority are skipped with
+    // skippedForeignOracle++ because the v17 program still enforces oracleAuthority on
+    // admin-push instructions. HYPERP oracle mode (UpdateHyperpMark, tag 34) is gone; a
+    // zero-feed market with a non-keeper oracleAuthority is an admin-oracle market and
+    // must not be cranked by an unpermissioned keeper.
+    it('v17: a market with a non-keeper admin-oracle authority is SKIPPED (not cranked)', async () => {
       const slabForeign = 'MarketFO3111111111111111111111111111111';
       const mockForeignMarket = {
         slabAddress: { toBase58: () => slabForeign },
         programId: { toBase58: () => '11111111111111111111111111111111' },
         config: {
           collateralMint: { toBase58: () => 'MintFO31111111111111111111111111111111' },
-          // Non-default, non-keeper oracle authority — the old "foreign oracle" case.
+          // Non-zero, non-keeper oracle authority → isAdminOracle()=true, keeper doesn't match.
           oracleAuthority: { toBase58: () => 'ForeignAuth31111111111111111111111111111', equals: (_o: any) => false },
-          indexFeedId: { toBytes: () => new Uint8Array(32) }, // index_feed_id == 0 → HYPERP
-          authorityPriceE6: BigInt(50_000_000), // mark already set → not hyperp-no-price-skipped
+          indexFeedId: { toBytes: () => new Uint8Array(32) }, // zero feed
+          authorityPriceE6: BigInt(50_000_000),
         },
         params: { maintenanceMarginBps: 500n },
         header: { admin: { toBase58: () => 'AdminFO31111111111111111111111111111111' } },
       };
 
-      // Keeper key does NOT match the foreign oracle authority — pre-fix this forced a skip.
       vi.mocked(shared.loadKeypair).mockReturnValue({
         publicKey: { toBase58: () => 'KeeperKey311111111111111111111111111111', equals: (_o: any) => false },
         secretKey: new Uint8Array(64),
@@ -805,9 +809,10 @@ describe('CrankService', () => {
       vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-foreign', estimatedCost: 5000 } as any);
       const result = await crankService.crankAll();
 
-      // Normal market cranked; foreign oracle market skipped → skipped >= 1
+      // v17: the non-keeper admin-oracle market is SKIPPED, not cranked.
       expect(result.skipped).toBeGreaterThanOrEqual(1);
-      expect(result.success).toBe(1);
+      expect(result.success).toBe(0);
+      expect(keeperSendModule.keeperSend).not.toHaveBeenCalled();
     });
 
     it('GH#1251: crankAll should count foreign-oracle market as skipped (not failed) even after discover() resets the flag', async () => {

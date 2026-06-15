@@ -958,7 +958,7 @@ export class CrankService {
         // M3: Validate each field independently — don't discard the entire row
         // when only one field is invalid.
         for (const row of data) {
-          const ca = row.mainnet_ca ?? undefined;
+          let ca = row.mainnet_ca ?? undefined;
           if (ca && !base58Re.test(ca)) {
             logger.warn("Invalid mainnet_ca from Supabase, ignoring field", { slabAddress: row.slab_address, mainnetCA: ca });
             ca = undefined;

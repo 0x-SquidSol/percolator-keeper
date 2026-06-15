@@ -66,16 +66,16 @@ describe("PoC: keeper HYPERP detection diverges from the program", () => {
   });
   afterEach(() => crank.stop());
 
-  it("FIXED: a HYPERP market with a non-zero hyperp_authority is now classified as hyperp", () => {
+  // v17: HYPERP oracle mode (UpdateHyperpMark, tag 34) was removed in v17.
+  // isHyperpOracle() always returns false in v17. These PoC tests verified the
+  // pre-Phase-G detection divergence fix in main; skipped here as HYPERP is removed.
+  it.skip("FIXED: a HYPERP market with a non-zero hyperp_authority is now classified as hyperp", () => {
     const market = { slabAddress: { toBase58: () => "Slab" }, config: { indexFeedId: ZERO_FEED, oracleAuthority: NONZERO_AUTH } };
-
-    // Program: this IS a hyperp market (index_feed_id == 0) and needs UpdateHyperpMark.
     expect(programIsHyperp(market)).toBe(true);
-    // Keeper now agrees (no longer gated on oracleAuthority) → UpdateHyperpMark is sent.
     expect((crank as any).isHyperpOracle(market)).toBe(true);
   });
 
-  it("a fresh HYPERP market (zero authority) is classified correctly", () => {
+  it.skip("a fresh HYPERP market (zero authority) is classified correctly", () => {
     const market = { slabAddress: { toBase58: () => "Slab" }, config: { indexFeedId: ZERO_FEED, oracleAuthority: ZERO_AUTH } };
     expect(programIsHyperp(market)).toBe(true);
     expect((crank as any).isHyperpOracle(market)).toBe(true);

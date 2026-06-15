@@ -1,4 +1,4 @@
-import { PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { PublicKey, TransactionInstruction, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   fetchSlab,
   parseConfig,
@@ -436,6 +436,8 @@ export class LiquidationService {
           marginRatio: 0,
           maintenanceMarginBps,
           v17PortfolioPubkey: c.portfolioPubkey,
+          // Oracle drift guard: use the scan-time price for drift detection in liquidate().
+          scanPriceE6: price,
         }));
       }
 

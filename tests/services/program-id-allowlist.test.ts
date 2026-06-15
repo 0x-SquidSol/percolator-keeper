@@ -19,12 +19,24 @@ const C = vi.hoisted(() => ({
 
 vi.mock("@percolatorct/sdk", () => ({
   discoverMarkets: vi.fn(async () => []),
-  encodeKeeperCrank: vi.fn(() => Buffer.from([1])),
-  encodeUpdateHyperpMark: vi.fn(() => Buffer.from([7])),
-  buildAccountMetas: vi.fn(() => []),
+  // v17 SDK API (replaces encodeKeeperCrank / encodeUpdateHyperpMark)
+  encodePermissionlessCrank: vi.fn(() => Buffer.from([5, 0, 0, 0, 0, 0])),
+  encodeRestartAssetOracle: vi.fn(() => Buffer.from([6])),
+  CrankAction: { Crank: 0, Liquidate: 1 },
   buildIx: vi.fn(() => ({})),
   derivePythPushOraclePDA: vi.fn(() => [{ toBase58: () => C.KNOWN_PROGRAM }, 0]),
-  parseHeader: vi.fn(() => ({ admin: { toBase58: () => "Admin1" } })),
+  fetchSlab: vi.fn(),
+  // v17 account detection — return false so parseMarketFromAccountData uses legacy parse path
+  isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(() => ({})),
+  parsePortfolioV17: vi.fn(),
+  encodeInitUser: vi.fn(() => Buffer.from([2])),
+  deriveLpVaultRegistry: vi.fn(() => [{ toBase58: () => C.KNOWN_PROGRAM }, 0]),
+  deriveLpBackingLedger: vi.fn(() => [{ toBase58: () => C.KNOWN_PROGRAM }, 0]),
+  parseLpVaultRegistry: vi.fn(() => null),
+  encodeLpVaultCrankFees: vi.fn(() => Buffer.from([3])),
+  // Legacy parse helpers used in parseMarketFromAccountData fallback path
+  parseHeader: vi.fn(() => ({ admin: { toBase58: () => "Admin1" }, magic: 0n, version: 12, kind: 1, marketCreatedSlot: 0n, resolvedSlot: 0n })),
   parseConfig: vi.fn(() => ({
     collateralMint: { toBase58: () => "Mint1111111111111111111111111111111111" },
     indexFeedId: { toBytes: () => new Uint8Array(32), toBase58: () => C.KNOWN_PROGRAM, equals: () => true },
@@ -32,9 +44,6 @@ vi.mock("@percolatorct/sdk", () => ({
   })),
   parseEngine: vi.fn(() => ({ totalOpenInterest: 0n })),
   parseParams: vi.fn(() => ({ maintenanceMarginBps: 500n })),
-  detectDexType: vi.fn(() => "raydium-clmm"),
-  parseDexPool: vi.fn(),
-  ACCOUNTS_KEEPER_CRANK: {},
 }));
 vi.mock("@percolatorct/shared", () => ({
   config: {
