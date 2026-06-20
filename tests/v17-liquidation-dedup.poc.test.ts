@@ -20,12 +20,16 @@ function makeHarness(): {
     ) => Promise<string | null>;
     _cycleSeenPositions: Set<string>;
     _cycleOwnerCounts: Map<string, number>;
+    _inFlightPositions: Set<string>;
     liquidate: ReturnType<typeof vi.fn>;
   };
 } {
   const service = Object.create(LiquidationService.prototype);
   service._cycleSeenPositions = new Set<string>();
   service._cycleOwnerCounts = new Map<string, number>();
+  // H-1: bypassing the constructor via Object.create skips class field
+  // initializers, so this must be seeded explicitly too.
+  service._inFlightPositions = new Set<string>();
   service.liquidate = vi.fn(async () => `sig-${service.liquidate.mock.calls.length}`);
   return { service };
 }

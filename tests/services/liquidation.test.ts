@@ -1031,4 +1031,152 @@ describe('LiquidationService', () => {
       expect(liquidateSpy).toHaveBeenCalledTimes(2);
     });
   });
+
+  // H-1: scanAndLiquidateAll's per-cycle clear() wiped _cycleSeenPositions
+  // even while a liquidate() call from a PREVIOUS cycle (or the LaserStream
+  // event path) was still awaiting RPCs/tx confirmation, letting the next
+  // cycle re-liquidate the same position before the first attempt landed.
+  describe('H-1: in-flight liquidation guard survives cycle-boundary clear()', () => {
+    function makeMarketAt(slabAddr: string) {
+      return {
+        slabAddress: { toBase58: () => slabAddr, equals: () => false },
+        programId: { toBase58: () => 'ProgramId1111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'Mint111111111111111111111111111111111111' },
+          oracleAuthority: mockZeroKey(),
+          indexFeedId: mockNonZeroKey('feed'),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+    }
+
+    function makeCandidate(slabAddress: string, accountIdx: number, owner: string) {
+      return {
+        slabAddress,
+        accountIdx,
+        owner,
+        positionSize: 1_000n,
+        capital: 100n,
+        pnl: -50n,
+        marginRatio: 4.0,
+        maintenanceMarginBps: 500n,
+      };
+    }
+
+    it('does not start a second liquidate() for a position whose prior liquidate() is still in flight when the next cycle clears _cycleSeenPositions', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const owner = 'OwnerInFlight11111111111111111111111111111';
+      const slab = 'SlabInFlight111111111111111111111111111111';
+
+      vi.spyOn(svc, 'scanMarket').mockImplementation(
+        async (market: any) =>
+          [makeCandidate(market.slabAddress.toBase58(), 9, owner)] as any,
+      );
+
+      // liquidate() never resolves until released -- simulates the
+      // multi-second RPC round trips (fresh slab/portfolio fetch, oracle
+      // resolve, send+confirm) that happen between adding to the dedup set
+      // and the tx actually landing on-chain.
+      let release!: (sig: string | null) => void;
+      const pending = new Promise<string | null>((resolve) => { release = resolve; });
+      const liquidateSpy = vi.spyOn(svc, 'liquidate').mockReturnValue(pending);
+
+      const markets = new Map([[slab, { market: makeMarketAt(slab) as any }]]);
+
+      // Cycle 1 kicks off gatedLiquidate -> liquidate(), which hangs.
+      const cycle1 = svc.scanAndLiquidateAll(markets);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Cycle 2 starts WHILE cycle 1's liquidate() is still in flight. Its
+      // unconditional clear() of _cycleSeenPositions/_cycleOwnerCounts must
+      // not let a second liquidate() start for the same position.
+      const cycle2 = await svc.scanAndLiquidateAll(markets);
+
+      expect(liquidateSpy).toHaveBeenCalledTimes(1);
+      expect(cycle2.liquidated).toBe(0);
+
+      release('sig-1');
+      const cycle1Result = await cycle1;
+      expect(cycle1Result.liquidated).toBe(1);
+      expect(liquidateSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows retry once the in-flight liquidate() has fully settled', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const owner = 'OwnerRetry111111111111111111111111111111111';
+      const slab = 'SlabRetry11111111111111111111111111111111111';
+
+      vi.spyOn(svc, 'scanMarket').mockImplementation(
+        async (market: any) =>
+          [makeCandidate(market.slabAddress.toBase58(), 3, owner)] as any,
+      );
+      const liquidateSpy = vi.spyOn(svc, 'liquidate').mockResolvedValue('mock-liq-sig');
+
+      const markets = new Map([[slab, { market: makeMarketAt(slab) as any }]]);
+
+      await svc.scanAndLiquidateAll(markets);
+      const second = await svc.scanAndLiquidateAll(markets);
+
+      // Once the first liquidate() resolved, the in-flight guard released
+      // the key -- the next cycle's legitimate partial-fill retry must work.
+      expect(liquidateSpy).toHaveBeenCalledTimes(2);
+      expect(second.liquidated).toBe(1);
+    });
+
+    it('releases the in-flight guard when liquidate() resolves to null (pre-submit recheck abort)', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const owner = 'OwnerAbort1111111111111111111111111111111';
+      const slab = 'SlabAbort11111111111111111111111111111111';
+      const market = makeMarketAt(slab);
+      const candidate = makeCandidate(slab, 2, owner);
+
+      const liquidateSpy = vi
+        .spyOn(svc, 'liquidate')
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce('sig-retry');
+
+      const first = await (svc as any).gatedLiquidate(market, candidate);
+      expect(first).toBeNull();
+
+      // Simulate the next polling cycle's boundary (scanAndLiquidateAll
+      // clears the per-cycle dedup state -- that part is unrelated to this
+      // test, which targets _inFlightPositions specifically).
+      (svc as any)._cycleSeenPositions.clear();
+      (svc as any)._cycleOwnerCounts.clear();
+
+      // A null (aborted) resolution must release the in-flight guard too,
+      // not just a successful signature -- otherwise every legitimate
+      // recheck-abort would permanently wedge the position.
+      const second = await (svc as any).gatedLiquidate(market, candidate);
+      expect(second).toBe('sig-retry');
+      expect(liquidateSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('blocks a concurrent gatedLiquidate call for the same position regardless of which path invoked it', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const owner = 'OwnerCrossPath111111111111111111111111111';
+      const slab = 'SlabCrossPath111111111111111111111111111111';
+      const market = makeMarketAt(slab);
+      const candidate = makeCandidate(slab, 5, owner);
+
+      let release!: (sig: string | null) => void;
+      const pending = new Promise<string | null>((resolve) => { release = resolve; });
+      const liquidateSpy = vi.spyOn(svc, 'liquidate').mockReturnValue(pending);
+
+      // First call (e.g. the LaserStream event path) starts a liquidation.
+      const firstCall = (svc as any).gatedLiquidate(market, candidate);
+      await Promise.resolve();
+
+      // Second call (e.g. the polling path re-discovering the same account)
+      // must be blocked while the first is still outstanding.
+      const secondResult = await (svc as any).gatedLiquidate(market, candidate);
+      expect(secondResult).toBeNull();
+      expect(liquidateSpy).toHaveBeenCalledTimes(1);
+
+      release('sig-first');
+      expect(await firstCall).toBe('sig-first');
+    });
+  });
 });

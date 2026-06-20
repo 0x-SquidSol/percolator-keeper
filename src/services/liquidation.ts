@@ -400,6 +400,18 @@ export class LiquidationService {
   private _cycleSeenPositions = new Set<string>();
   private _cycleOwnerCounts = new Map<string, number>();
   private static readonly MAX_LIQ_PER_OWNER_PER_CYCLE = 3;
+  // H-1: positions with a liquidate() call currently in flight (added before
+  // awaiting liquidate(), removed in a finally once it settles). Intentionally
+  // separate from _cycleSeenPositions above: that Set is cleared at the start
+  // of every polling cycle (scanAndLiquidateAll) to bound the per-cycle dedup
+  // window, but clearing it must never erase the fact that a liquidate() call
+  // for a position is still physically executing -- otherwise a poll cycle
+  // that starts while an event-driven liquidate() is mid-flight (multiple
+  // sequential RPC round trips, easily outlasting one cycle) can re-target
+  // and double-submit the same on-chain account before the first tx confirms.
+  // gatedLiquidate is the sole entry point for both the polling path and the
+  // LaserStream event path, so guarding here covers both unconditionally.
+  private readonly _inFlightPositions = new Set<string>();
   // B5: collapse per-liquidation Discord alerts into a single summary alert per
   // market within a 5 s window — prevents cascade-driven channel flooding.
   private readonly _liquidationAlertAggregator = new AlertAggregator(
@@ -625,6 +637,17 @@ export class LiquidationService {
     const positionKey = candidate.v17PortfolioPubkey
       ? `${candidate.slabAddress}:v17:${candidate.v17PortfolioPubkey.toBase58()}`
       : `${candidate.slabAddress}:v12:${candidate.accountIdx}`;
+    // H-1: an in-flight liquidate() for this exact position (started by
+    // either the polling path or the event-driven path) takes priority over
+    // the per-cycle dedup set, which can be cleared out from under us by a
+    // concurrent scanAndLiquidateAll() while we're still awaiting RPCs below.
+    if (this._inFlightPositions.has(positionKey)) {
+      logger.debug("Skipping position with an in-flight liquidate() call", {
+        positionKey,
+        owner: candidate.owner.slice(0, 8),
+      });
+      return null;
+    }
     if (this._cycleSeenPositions.has(positionKey)) {
       logger.debug("Skipping position already targeted this cycle", {
         positionKey,
@@ -642,12 +665,19 @@ export class LiquidationService {
     }
     this._cycleSeenPositions.add(positionKey);
     this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
-    return (await this.liquidate(
-      market,
-      candidate.accountIdx,
-      candidate.v17PortfolioPubkey,
-      candidate.scanPriceE6,
-    )) ?? null;
+    this._inFlightPositions.add(positionKey);
+    try {
+      return (await this.liquidate(
+        market,
+        candidate.accountIdx,
+        candidate.v17PortfolioPubkey,
+        candidate.scanPriceE6,
+      )) ?? null;
+    } finally {
+      // Always release, regardless of success, a returned null (race-
+      // condition abort inside liquidate()), or an unexpected thrown error.
+      this._inFlightPositions.delete(positionKey);
+    }
   }
 
   /**
