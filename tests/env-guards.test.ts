@@ -165,12 +165,19 @@ describe("validateKeeperEnvGuards", () => {
         SOLANA_RPC_WS_URL: "wss://api.mainnet-beta.solana.com",
         FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
         RPC_URL: "https://api.mainnet-beta.solana.com",
+        KEEPER_REDIS_URL: "https://fake-host.upstash.io",
+        KEEPER_REDIS_TOKEN: "fake-token",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
 
     it("accepts HA_ENABLED=true + NETWORK=devnet", () => {
-      const env = { HA_ENABLED: "true", NETWORK: "devnet" } as NodeJS.ProcessEnv;
+      const env = {
+        HA_ENABLED: "true",
+        NETWORK: "devnet",
+        KEEPER_REDIS_URL: "https://fake-host.upstash.io",
+        KEEPER_REDIS_TOKEN: "fake-token",
+      } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
 
@@ -184,6 +191,99 @@ describe("validateKeeperEnvGuards", () => {
     });
 
     it("accepts HA_ENABLED=false (not 'true') regardless of NETWORK state", () => {
+      const env = { HA_ENABLED: "false" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+  });
+
+  // C-1 (CRITICAL): HA_ENABLED=true with KEEPER_REDIS_URL unset silently fell
+  // back to standalone-leader mode in index.ts (only a logger.warn, no
+  // throw), so every replica in a multi-replica deployment believed it was
+  // the sole leader simultaneously — duplicate liquidations/cranks
+  // (split-brain) with no boot-time signal.
+  describe("C-1: HA_ENABLED requires KEEPER_REDIS_URL + KEEPER_REDIS_TOKEN", () => {
+    it("throws when HA_ENABLED=true and KEEPER_REDIS_URL is unset", () => {
+      const env = { HA_ENABLED: "true", NETWORK: "devnet" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /HA_ENABLED.*requires.*KEEPER_REDIS_URL/i,
+      );
+    });
+
+    it("throws when HA_ENABLED=true and KEEPER_REDIS_URL is empty string", () => {
+      const env = {
+        HA_ENABLED: "true",
+        NETWORK: "devnet",
+        KEEPER_REDIS_URL: "",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /HA_ENABLED.*requires.*KEEPER_REDIS_URL/i,
+      );
+    });
+
+    it("throws when HA_ENABLED=true and KEEPER_REDIS_URL is whitespace-only", () => {
+      const env = {
+        HA_ENABLED: "true",
+        NETWORK: "devnet",
+        KEEPER_REDIS_URL: "   ",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /HA_ENABLED.*requires.*KEEPER_REDIS_URL/i,
+      );
+    });
+
+    it("throws when HA_ENABLED=true, KEEPER_REDIS_URL is set, but KEEPER_REDIS_TOKEN is unset", () => {
+      const env = {
+        HA_ENABLED: "true",
+        NETWORK: "devnet",
+        KEEPER_REDIS_URL: "https://fake-host.upstash.io",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /HA_ENABLED.*KEEPER_REDIS_URL.*KEEPER_REDIS_TOKEN/i,
+      );
+    });
+
+    it("throws when HA_ENABLED=true, KEEPER_REDIS_URL is set, but KEEPER_REDIS_TOKEN is empty string", () => {
+      const env = {
+        HA_ENABLED: "true",
+        NETWORK: "devnet",
+        KEEPER_REDIS_URL: "https://fake-host.upstash.io",
+        KEEPER_REDIS_TOKEN: "",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /HA_ENABLED.*KEEPER_REDIS_URL.*KEEPER_REDIS_TOKEN/i,
+      );
+    });
+
+    it("throws when HA_ENABLED=true and KEEPER_REDIS_TOKEN is whitespace-only", () => {
+      const env = {
+        HA_ENABLED: "true",
+        NETWORK: "devnet",
+        KEEPER_REDIS_URL: "https://fake-host.upstash.io",
+        KEEPER_REDIS_TOKEN: "   ",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /HA_ENABLED.*KEEPER_REDIS_URL.*KEEPER_REDIS_TOKEN/i,
+      );
+    });
+
+    it("accepts HA_ENABLED=true with both KEEPER_REDIS_URL and KEEPER_REDIS_TOKEN set", () => {
+      const env = {
+        HA_ENABLED: "true",
+        NETWORK: "devnet",
+        KEEPER_REDIS_URL: "https://fake-host.upstash.io",
+        KEEPER_REDIS_TOKEN: "fake-token",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    it("does NOT require KEEPER_REDIS_URL/KEEPER_REDIS_TOKEN when HA_ENABLED is unset", () => {
+      expect(() => validateKeeperEnvGuards({} as NodeJS.ProcessEnv)).not.toThrow();
+      expect(() =>
+        validateKeeperEnvGuards({ NETWORK: "testnet" } as NodeJS.ProcessEnv),
+      ).not.toThrow();
+    });
+
+    it("does NOT require KEEPER_REDIS_URL/KEEPER_REDIS_TOKEN when HA_ENABLED=false", () => {
       const env = { HA_ENABLED: "false" } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });

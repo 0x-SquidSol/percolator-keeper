@@ -175,6 +175,31 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
         `HA_ENABLED=true: NETWORK must resolve to 'mainnet' or 'devnet' (got '${raw.slice(0, 20)}').`,
       );
     }
+
+    // C-1 (CRITICAL): index.ts only builds a LeaderLock when getRedisClient()
+    // returns non-null. If KEEPER_REDIS_URL is unset, it silently falls back
+    // to standalone-leader mode (every replica believes it is the sole
+    // leader) with just a logger.warn — split-brain on any multi-replica
+    // deployment. Fail boot instead of degrading silently.
+    const redisUrl = env.KEEPER_REDIS_URL?.trim();
+    if (!redisUrl) {
+      throw new Error(
+        "HA_ENABLED=true requires KEEPER_REDIS_URL to be set. Running HA " +
+          "mode without Redis silently falls back to standalone-leader on " +
+          "every replica, risking duplicate liquidations/cranks " +
+          "(split-brain). Set KEEPER_REDIS_URL (and KEEPER_REDIS_TOKEN) to " +
+          "your Upstash REST endpoint, or set HA_ENABLED=false for a " +
+          "single-replica deployment.",
+      );
+    }
+    const redisToken = env.KEEPER_REDIS_TOKEN?.trim();
+    if (!redisToken) {
+      throw new Error(
+        "HA_ENABLED=true and KEEPER_REDIS_URL is set, but KEEPER_REDIS_TOKEN " +
+          "is missing or empty. Set KEEPER_REDIS_TOKEN to the Upstash REST " +
+          "token (no empty-string fallback is permitted).",
+      );
+    }
   }
 
   if (!allowInsecure) {
