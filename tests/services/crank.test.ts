@@ -331,6 +331,85 @@ describe('CrankService', () => {
       await crankService.discover();
       expect(crankService.getMarkets().size).toBe(0);
     }, 20000);
+
+    it('retries v17 keeper portfolio provisioning on normal rediscovery when keeperPortfolio is null', async () => {
+      const prevLaserStream = process.env.KEEPER_USE_LASERSTREAM;
+      delete process.env.KEEPER_USE_LASERSTREAM;
+
+      try {
+        const slabAddress = new PublicKey('11111111111111111111111111111111');
+
+        const service = new CrankService(mockOracleService);
+
+        const mockMarket = {
+          slabAddress,
+          programId: new PublicKey('11111111111111111111111111111111'),
+          config: {
+            collateralMint: new PublicKey('11111111111111111111111111111111'),
+            oracleAuthority: PublicKey.default,
+            indexFeedId: { toBytes: () => new Uint8Array(32) },
+          },
+          params: { maintenanceMarginBps: 500n },
+          header: { admin: PublicKey.default, version: 16, kind: 1 },
+          _rawV17Config: {},
+        };
+
+        // Simulate a v17 market that was already discovered, but its keeper
+        // portfolio provisioning failed transiently, leaving keeperPortfolio null.
+        (service as any).markets.set(slabAddress.toBase58(), {
+          market: mockMarket,
+          lastCrankTime: 0,
+          successCount: 0,
+          failureCount: 0,
+          consecutiveFailures: 0,
+          isActive: true,
+          missingDiscoveryCount: 0,
+          keeperPortfolio: null,
+        });
+
+        // Force discover() to take the normal full rediscovery path.
+        (service as any)._lastFullRediscoverTime = 0;
+
+        const discoveredMarkets = [mockMarket];
+        vi.mocked(core.discoverMarkets)
+          .mockResolvedValueOnce(discoveredMarkets as any)
+          .mockResolvedValue([]);
+
+        const getProgramAccounts = vi.fn().mockResolvedValue([]);
+        const getMinimumBalanceForRentExemption = vi.fn().mockResolvedValue(1);
+
+        vi.mocked(shared.getConnection).mockClear();
+        vi.mocked(shared.getConnection).mockReturnValueOnce({
+          getAccountInfo: vi.fn(),
+          getSlot: vi.fn().mockResolvedValue(200),
+          getProgramAccounts,
+          getMinimumBalanceForRentExemption,
+        } as any);
+
+        await service.discover();
+
+        // Normal rediscovery should retry the v17 portfolio provisioning path
+        // for an existing market whose keeperPortfolio is still null.
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(core.discoverMarkets).toHaveBeenCalled();
+        expect(shared.getConnection).toHaveBeenCalledTimes(1);
+        expect(getProgramAccounts).toHaveBeenCalledTimes(1);
+        expect(getProgramAccounts.mock.calls[0]?.[0]).toBe(mockMarket.programId);
+        expect(getProgramAccounts.mock.calls[0]?.[1]?.filters).toContainEqual({ dataSize: 9347 });
+
+        service.stop();
+      } finally {
+        if (prevLaserStream === undefined) {
+          delete process.env.KEEPER_USE_LASERSTREAM;
+        } else {
+          process.env.KEEPER_USE_LASERSTREAM = prevLaserStream;
+        }
+      }
+    });
+
   });
 
   describe('crankMarket', () => {
