@@ -525,6 +525,15 @@ describe("AccountLoader", () => {
   });
 });
 
+describe("AccountLoader — M-7: canonical program id", () => {
+  it("defaults to the canonical MAINNET_PROGRAM_ID (boot-assertions.js) when no programId override is given", async () => {
+    const { MAINNET_PROGRAM_ID } = await import("../../src/lib/boot-assertions.js");
+    const l = new AccountLoader(BASE_OPTS, new FakeAdapter());
+    expect(l.getProgramId()).toBe(MAINNET_PROGRAM_ID);
+    await l.stop();
+  });
+});
+
 describe("AccountLoader stress test", () => {
   it.skipIf(!process.env.STRESS)(
     "processes 10k events/sec for 60s without counter drift",

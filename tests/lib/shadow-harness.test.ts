@@ -18,6 +18,7 @@ vi.mock("../../src/lib/metrics.js", () => ({
 
 import * as shared from "@percolatorct/shared";
 import { ShadowHarness, computeDivergencePct } from "../../src/lib/shadow-harness.js";
+import { MAINNET_PROGRAM_ID } from "../../src/lib/boot-assertions.js";
 import type { DecisionEntry } from "../../src/lib/decision-log.js";
 import type { Connection } from "@solana/web3.js";
 import { PublicKey } from "@solana/web3.js";
@@ -358,6 +359,29 @@ describe("ShadowHarness — comparison logic", () => {
     expect(() => harness.start()).not.toThrow(); // idempotent
     expect(() => harness.stop()).not.toThrow();
     expect(() => harness.stop()).not.toThrow(); // idempotent
+  });
+
+  it("M-7: falls back to the canonical MAINNET_PROGRAM_ID (boot-assertions.js) when no programId/PROGRAM_ID is given", async () => {
+    const origEnv = process.env.PROGRAM_ID;
+    delete process.env.PROGRAM_ID;
+    try {
+      const conn = makeConnection(0);
+      const harness = new ShadowHarness({
+        connection: conn,
+        readDecisions: vi.fn(async () => []),
+        compareWindowMs: 300_000,
+      });
+      await harness.runCycle();
+      expect(conn.getSignaturesForAddress).toHaveBeenCalledWith(
+        expect.objectContaining({ toBase58: expect.any(Function) }),
+        expect.anything(),
+      );
+      const calledWith = vi.mocked(conn.getSignaturesForAddress).mock.calls[0][0] as PublicKey;
+      expect(calledWith.toBase58()).toBe(MAINNET_PROGRAM_ID);
+    } finally {
+      if (origEnv === undefined) delete process.env.PROGRAM_ID;
+      else process.env.PROGRAM_ID = origEnv;
+    }
   });
 });
 

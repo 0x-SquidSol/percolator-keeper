@@ -38,6 +38,7 @@ import {
   shadowMatchTotal,
   shadowDivergencePct,
 } from "./metrics.js";
+import { MAINNET_PROGRAM_ID as FALLBACK_PROGRAM_ID } from "./boot-assertions.js";
 
 const logger = createLogger("keeper:shadow-harness");
 
@@ -52,9 +53,6 @@ const DEFAULT_SILENT_CYCLES_BEFORE_ALERT = 3;   // ~15 min at 5 min/cycle
 const DEFAULT_RUNAWAY_MULTIPLIER = 3;            // shadow > 3x live
 const DEFAULT_RUNAWAY_MIN_SAMPLES = 10;          // small-sample guard
 const DEFAULT_ALERT_COOLDOWN_MS = 3_600_000;     // 1 hour between alerts
-// When the program id is not set in env, fall back to the mainnet constant.
-// This constant must match MAINNET_PROGRAM_ID in boot-assertions.ts.
-const FALLBACK_PROGRAM_ID = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 
 export interface ShadowCompareResult {
   windowMs: number;

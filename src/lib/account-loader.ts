@@ -3,10 +3,10 @@ import { createLogger } from "@percolatorct/shared";
 import { AccountCache } from "./account-cache.js";
 import { ReconnectBackoff } from "./stream-reconnect.js";
 import { SlotTracker } from "./slot-tracker.js";
+import { MAINNET_PROGRAM_ID } from "./boot-assertions.js";
 
 const logger = createLogger("keeper:account-loader");
 
-const MAINNET_PROGRAM_ID = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const DEFAULT_DROP_QUEUE_MAX = 10_000;
 // C3: getMultipleAccountsInfo RPC accepts up to 100 pubkeys per call.
 const SNAPSHOT_CHUNK_SIZE = 100;
