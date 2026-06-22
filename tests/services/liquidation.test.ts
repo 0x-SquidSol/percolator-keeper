@@ -522,6 +522,103 @@ describe('LiquidationService', () => {
         expect(shared.sendCriticalAlert).not.toHaveBeenCalled();
       });
     });
+
+    describe('M-9: scanV17Portfolios re-checks market_group_id against the RPC memcmp filter', () => {
+      const mockMarket = {
+        slabAddress: mockNonZeroKey('MarketV17Scan111111111111111111111111'),
+        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111' },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+          authorityPriceE6: 1_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+
+      function makeRawPortfolio(label: string) {
+        return {
+          pubkey: { toBase58: () => `Portfolio${label}111111111111111111111111` } as any,
+          account: { data: new Uint8Array(16) },
+        };
+      }
+
+      it('skips a portfolio whose parsed marketGroupId does not match the scanned market', async () => {
+        vi.mocked(core.isV17Account).mockReturnValueOnce(true);
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9_347));
+        vi.mocked(shared.getConnection).mockReturnValue({
+          getProgramAccounts: vi.fn(async () => [makeRawPortfolio('Mismatched')]),
+        } as any);
+        vi.mocked(core.parsePortfolioV17).mockReturnValueOnce({
+          marketGroupId: mockNonZeroKey('SomeOtherMarket1111111111111111111111'),
+          owner: mockNonZeroKey('Owner11111111111111111111111111111111'),
+          capital: 1_000_000n,
+          pnl: 0n,
+          feeCredits: 0n,
+          legs: [{ active: true, basisPosQ: 100_000_000_000n, assetIndex: 0 }],
+        } as any);
+
+        const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+        expect(candidates).toEqual([]);
+      });
+
+      it('keeps a portfolio whose parsed marketGroupId matches the scanned market', async () => {
+        vi.mocked(core.isV17Account).mockReturnValueOnce(true);
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9_347));
+        vi.mocked(shared.getConnection).mockReturnValue({
+          getProgramAccounts: vi.fn(async () => [makeRawPortfolio('Matching')]),
+        } as any);
+        vi.mocked(core.parsePortfolioV17).mockReturnValueOnce({
+          marketGroupId: mockMarket.slabAddress,
+          owner: mockNonZeroKey('Owner11111111111111111111111111111111'),
+          capital: 100_000_000n, // 100 USDC — undercollateralized vs the position below
+          pnl: 0n,
+          feeCredits: 0n,
+          legs: [{ active: true, basisPosQ: 10_000_000_000n, assetIndex: 0 }],
+        } as any);
+
+        const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+        expect(candidates).toHaveLength(1);
+      });
+
+      it('evaluates a mixed batch correctly: drops the mismatched portfolio, keeps the matching one', async () => {
+        vi.mocked(core.isV17Account).mockReturnValueOnce(true);
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9_347));
+        vi.mocked(shared.getConnection).mockReturnValue({
+          getProgramAccounts: vi.fn(async () => [
+            makeRawPortfolio('Mismatched'),
+            makeRawPortfolio('Matching'),
+          ]),
+        } as any);
+        vi.mocked(core.parsePortfolioV17)
+          .mockReturnValueOnce({
+            marketGroupId: mockNonZeroKey('SomeOtherMarket1111111111111111111111'),
+            owner: mockNonZeroKey('OwnerMismatched111111111111111111111'),
+            capital: 1_000_000n,
+            pnl: 0n,
+            feeCredits: 0n,
+            legs: [{ active: true, basisPosQ: 100_000_000_000n, assetIndex: 0 }],
+          } as any)
+          .mockReturnValueOnce({
+            marketGroupId: mockMarket.slabAddress,
+            owner: mockNonZeroKey('OwnerMatching11111111111111111111111'),
+            capital: 100_000_000n,
+            pnl: 0n,
+            feeCredits: 0n,
+            legs: [{ active: true, basisPosQ: 10_000_000_000n, assetIndex: 0 }],
+          } as any);
+
+        const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+        expect(candidates).toHaveLength(1);
+        expect(candidates[0].owner).toBe('OwnerMatching11111111111111111111111');
+      });
+    });
   });
 
   describe('liquidate', () => {

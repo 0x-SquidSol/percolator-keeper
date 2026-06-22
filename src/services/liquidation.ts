@@ -169,6 +169,22 @@ async function scanV17Portfolios(
       const data = new Uint8Array(account.data);
       const pf = parsePortfolioV17(data);
 
+      // M-9: getProgramAccounts' memcmp filter is enforced RPC-side, not
+      // on-chain -- a non-conforming or misbehaving RPC could return a
+      // portfolio belonging to a different market. Re-derive the same
+      // market_group_id check the filter was supposed to perform from the
+      // parsed account data itself, rather than trusting the RPC's filtering.
+      // A mismatch here would otherwise evaluate this portfolio's legs
+      // against the WRONG market's price/maintenanceMarginBps.
+      if (!pf.marketGroupId.equals(market.slabAddress)) {
+        logger.warn("scanV17Portfolios: RPC returned portfolio for a different market — skipping", {
+          expectedMarket: marketKey.slice(0, 8),
+          actualMarket: pf.marketGroupId.toBase58().slice(0, 8),
+          portfolio: pubkey.toBase58().slice(0, 8),
+        });
+        continue;
+      }
+
       // Check each active leg for undercollateralization.
       // DESYNC-4: asset_index is the leg's assetIndex field (0 for single-asset markets).
       for (const leg of pf.legs) {
