@@ -50,8 +50,8 @@ describe("PoC: v17 risk params are parsed from the market-group header", () => {
   // H-8: a zero (or implausibly large) maintenanceMarginBps makes the
   // liquidation-candidacy comparison `marginRatioBps < maintenanceMarginBps`
   // unsatisfiable (0n<0n is always false) or trivially satisfied for every
-  // position (>=10000n), silently. Neither is a real on-chain config --
-  // reject both at parse time.
+  // position (>10000n), silently. The engine permits exactly 100% margin as
+  // a fast-path config, so the valid parser range is (0, 10000].
   describe("H-8: maintenanceMarginBps sanity validation", () => {
     function buildData(maintenanceMarginBps: bigint): Uint8Array {
       const data = new Uint8Array(V17_RISK_PARAMS_MIN_DATA_LEN);
@@ -68,8 +68,8 @@ describe("PoC: v17 risk params are parsed from the market-group header", () => {
       expect(() => parseV17RiskParams(buildData(0n))).toThrow(/maintenanceMarginBps=0/);
     });
 
-    it("throws when maintenanceMarginBps decodes to >= 10_000 (>= 100% margin)", () => {
-      expect(() => parseV17RiskParams(buildData(10_000n))).toThrow(V17RiskParamsCorruptedError);
+    it("throws when maintenanceMarginBps decodes above 10_000 (> 100% margin)", () => {
+      expect(() => parseV17RiskParams(buildData(10_001n))).toThrow(V17RiskParamsCorruptedError);
     });
 
     it("throws when maintenanceMarginBps decodes to an implausibly huge corrupted value", () => {
@@ -78,9 +78,10 @@ describe("PoC: v17 risk params are parsed from the market-group header", () => {
       );
     });
 
-    it("accepts the boundary values 1 and 9999 bps", () => {
+    it("accepts the boundary values 1, 9999, and 10000 bps", () => {
       expect(parseV17RiskParams(buildData(1n)).maintenanceMarginBps).toBe(1n);
       expect(parseV17RiskParams(buildData(9_999n)).maintenanceMarginBps).toBe(9_999n);
+      expect(parseV17RiskParams(buildData(10_000n)).maintenanceMarginBps).toBe(10_000n);
     });
   });
 });
