@@ -25,6 +25,7 @@ import {
 import { config, getConnection, getFallbackConnection, loadKeypair, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
+import { isCustomProgramError } from "../lib/program-error.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import {
   txSentTotal,
@@ -1626,9 +1627,11 @@ export class CrankService {
         });
       }
 
-      // Detect NotInitialized (error 0x4) — permanently skip these markets
-      // PERC-381: Track skip count and timestamp for exponential cooldown on rediscovery
-      if (errMsg.includes("custom program error: 0x4")) {
+      // Detect InvalidSlabLen (error 0x4) — permanently skip these markets.
+      // PERC-381: Track skip count and timestamp for exponential cooldown on rediscovery.
+      // Exact-code match: a substring check would also catch 0x40–0x4f / 0x400+
+      // and permanently skip a healthy market on an unrelated engine error.
+      if (isCustomProgramError(errMsg, 0x4)) {
         state.permanentlySkipped = true;
         state.permanentlySkippedAt = Date.now();
         state.skipCount = (state.skipCount ?? 0) + 1;

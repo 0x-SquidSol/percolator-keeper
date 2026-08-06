@@ -19,6 +19,7 @@ import {
 import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, sendCriticalAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
+import { isCustomProgramError } from "../lib/program-error.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import {
   txSentTotal,
@@ -1383,8 +1384,10 @@ export class LiquidationService {
 
       // PERC-484: InvalidSlabLen (0x4) means the slab has wrong size for the program.
       // These are test/corrupt markets that will never succeed — permanently skip them
-      // so the liquidation service stops retrying every 60 seconds.
-      if (errMsg.includes("custom program error: 0x4")) {
+      // so the liquidation service stops retrying every 60 seconds. Exact-code match:
+      // a substring check would also catch 0x40–0x4f / 0x400+ and permanently drop a
+      // healthy market from liquidation on an unrelated engine error.
+      if (isCustomProgramError(errMsg, 0x4)) {
         this.permanentlySkipped.add(slabAddress.toBase58());
         logger.warn(
           "Market slab size mismatch (0x4 InvalidSlabLen) — permanently skipping for liquidation. " +
