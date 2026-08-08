@@ -512,7 +512,9 @@ async function provisionKeeperPortfolio(
   } catch (provisionErr) {
     const errMsg = provisionErr instanceof Error ? provisionErr.message : String(provisionErr);
     // AlreadyInitialized: a concurrent provision beat us; re-query for the existing portfolio.
-    if (errMsg.includes("AlreadyInitialized") || errMsg.includes("custom program error: 0x0")) {
+    // Exact-code match on 0x0 — a substring check also caught 0x00–0x0f (codes 1–15),
+    // misrouting an unrelated failure into this re-query path.
+    if (errMsg.includes("AlreadyInitialized") || isCustomProgramError(errMsg, 0x0)) {
       logger.info("provisionKeeperPortfolio: AlreadyInitialized — re-querying for existing portfolio", {
         market: marketKeyBase58.slice(0, 8),
       });
