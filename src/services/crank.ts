@@ -606,13 +606,25 @@ async function crankLpVault(
     domainIdx = 0;
   }
 
+  // v17 dual-domain: tag 78 names the pot the fees land in and needs BOTH
+  // ledgers. We credit the registry's own domain; a rebalance (tag 91) can move
+  // the resulting backing if the house is drawing on the other pot. The target
+  // ledger is created on first use, so the cranker must be writable (it pays the
+  // rent) and the system program is required.
   const [ledgerPda] = deriveLpBackingLedger(programId, market.slabAddress, domainIdx);
-  const data = encodeLpVaultCrankFees();
+  const [siblingLedgerPda] = deriveLpBackingLedger(
+    programId,
+    market.slabAddress,
+    domainIdx ^ 1,
+  );
+  const data = encodeLpVaultCrankFees({ domain: domainIdx });
   const keys = [
-    { pubkey: keypair.publicKey, isSigner: true,  isWritable: false },
+    { pubkey: keypair.publicKey, isSigner: true,  isWritable: true  },
     { pubkey: market.slabAddress, isSigner: false, isWritable: true  },
     { pubkey: registryPda,        isSigner: false, isWritable: true  },
     { pubkey: ledgerPda,          isSigner: false, isWritable: true  },
+    { pubkey: siblingLedgerPda,   isSigner: false, isWritable: true  },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
   ];
   const ix = buildIx({ programId, keys, data });
 

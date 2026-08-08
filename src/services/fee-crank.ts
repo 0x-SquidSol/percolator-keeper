@@ -48,7 +48,7 @@
  * abort the cycle for any other market or any other leg.
  */
 
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, SystemProgram } from "@solana/web3.js";
 import type { Connection, Keypair, TransactionInstruction } from "@solana/web3.js";
 import {
   buildIx,
@@ -424,16 +424,26 @@ export const lpVaultCrankFeesLeg: CrankLeg = {
       return [];
     }
 
+    // v17 dual-domain: the vault can hold backing in EITHER pot of its asset,
+    // so tag 78 now names the pot the fees land in and needs both ledgers. We
+    // credit the registry's own domain — fees become backing there, and a
+    // rebalance (tag 91) can move them if the house needs the other pot.
+    // The sibling ledger may not exist yet; the program creates the target
+    // ledger on first use, which is why the cranker must be writable (it pays
+    // the rent) and the system program is required.
     const [ledgerPda] = deriveLpBackingLedger(programId, address, domainIdx);
+    const [siblingLedgerPda] = deriveLpBackingLedger(programId, address, domainIdx ^ 1);
     const ix = buildIx({
       programId,
       keys: [
-        { pubkey: ctx.keypair.publicKey, isSigner: true, isWritable: false },
+        { pubkey: ctx.keypair.publicKey, isSigner: true, isWritable: true },
         { pubkey: address, isSigner: false, isWritable: true },
         { pubkey: registryPda, isSigner: false, isWritable: true },
         { pubkey: ledgerPda, isSigner: false, isWritable: true },
+        { pubkey: siblingLedgerPda, isSigner: false, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
       ],
-      data: encodeLpVaultCrankFees(),
+      data: encodeLpVaultCrankFees({ domain: domainIdx }),
     });
 
     return [
