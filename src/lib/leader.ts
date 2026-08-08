@@ -116,10 +116,13 @@ export class LeaderLock {
     const ttlSec = Math.ceil(this.ttlMs / 1000);
 
     try {
+      // Stamp before the SET so the watchdog deadline is measured from when the
+      // lease request was issued (see _armLeaseWatchdog).
+      const acquiredAt = Date.now();
       const result = await this.redis.set(this._lockKey, this.identity, { ex: ttlSec, nx: true } as { ex: number; nx: true });
 
       if (result === "OK") {
-        this._promote(opts);
+        this._promote(opts, acquiredAt);
       } else {
         this._enterStandby(opts);
       }
@@ -132,14 +135,15 @@ export class LeaderLock {
     }
   }
 
-  private _promote(opts: StartOptions): void {
+  private _promote(opts: StartOptions, leaseIssuedAt: number): void {
     if (this._stopped) return;
     this._role = "leader";
     this._renewFailures = 0;
     logger.info("LeaderLock promoted to leader", { identity: this.identity });
     // Arm the lease watchdog before firing onPromote so the split-brain guard is
     // live even if the handler throws (mirrors _demote arming the poll first).
-    this._armLeaseWatchdog();
+    // leaseIssuedAt is when the acquiring SET NX was issued, not when _promote runs.
+    this._armLeaseWatchdog(leaseIssuedAt);
     opts.onPromote();
     this._scheduleRenew(opts);
   }
@@ -151,15 +155,21 @@ export class LeaderLock {
     this._renewTimer.unref?.();
   }
 
-  // Lease-expiry watchdog. The Redis lock we hold expires ttlMs after our last
-  // successful acquire/renew; if we cannot confirm a renewal before then — the
-  // eval hangs, times out repeatedly, or errors — we MUST relinquish leadership
-  // so a standby that acquires the now-free lock is the only writer. This is the
-  // hard guarantee behind the 2-strike renew counter: regardless of how renewal
-  // fails, a node stops believing it is leader by its own lease deadline. Armed
-  // on promotion and re-armed on every successful renewal.
-  private _armLeaseWatchdog(): void {
+  // Lease-expiry watchdog. The Redis lock expires ttlMs after Redis EXECUTES our
+  // acquire/renew, which happens between our request and its response. We measure
+  // the deadline from when the request was ISSUED (`leaseIssuedAt`), not when it
+  // resolved: measuring from issue time is conservative (arms slightly early,
+  // never late), so a slow-but-not-hung Redis — a renewal that succeeds just
+  // under renewTimeoutMs — cannot leave us believing we still hold a lease that
+  // has, on Redis's clock, already expired (which would open a dual-leader window
+  // up to renewTimeoutMs wide). If we cannot confirm a renewal before the
+  // deadline — the eval hangs, times out repeatedly, or errors — we MUST
+  // relinquish leadership so a standby that acquires the now-free lock is the
+  // only writer. This is the hard guarantee behind the 2-strike renew counter.
+  // Armed on promotion and re-armed on every successful renewal.
+  private _armLeaseWatchdog(leaseIssuedAt: number): void {
     if (this._leaseTimer) clearTimeout(this._leaseTimer);
+    const remainingMs = Math.max(0, this.ttlMs - (Date.now() - leaseIssuedAt));
     this._leaseTimer = setTimeout(() => {
       if (this._stopped || this._role !== "leader") return;
       logger.error(
@@ -167,7 +177,7 @@ export class LeaderLock {
         { identity: this.identity, ttlMs: this.ttlMs },
       );
       this._demote("lease-expired");
-    }, this.ttlMs);
+    }, remainingMs);
     this._leaseTimer.unref?.();
   }
 
@@ -205,6 +215,9 @@ export class LeaderLock {
       // demotes IMMEDIATELY — it is NOT a transient error and must bypass the
       // 2-strike counter (which is reserved for thrown transport errors).
       // Bounded by a timeout so a hung Redis cannot stall this await forever.
+      // Stamp before the eval so the watchdog deadline is measured from when the
+      // renew request was issued, not when Redis replied (see _armLeaseWatchdog).
+      const issuedAt = Date.now();
       const result = await this._evalRenewWithTimeout();
 
       // A hung/slow eval may resolve after a concurrent stop() or after the
@@ -214,8 +227,9 @@ export class LeaderLock {
 
       if (result === 1) {
         this._renewFailures = 0;
-        // Fresh lease confirmed — push the split-brain watchdog out by ttlMs.
-        this._armLeaseWatchdog();
+        // Fresh lease confirmed — push the split-brain watchdog out, dated from
+        // when Redis received the renew (issuedAt), not from now.
+        this._armLeaseWatchdog(issuedAt);
         this._scheduleRenew(opts);
         return;
       }
@@ -296,10 +310,11 @@ export class LeaderLock {
 
       if (current === null) {
         const ttlSec = Math.ceil(this.ttlMs / 1000);
+        const acquiredAt = Date.now();
         const result = await this.redis.set(this._lockKey, this.identity, { ex: ttlSec, nx: true } as { ex: number; nx: true });
         if (this._stopped || this._role !== "standby") return;
         if (result === "OK") {
-          this._promote(opts);
+          this._promote(opts, acquiredAt);
           return;
         }
       }
