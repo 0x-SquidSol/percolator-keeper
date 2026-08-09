@@ -1,5 +1,7 @@
 import { PublicKey, SystemProgram, Keypair } from "@solana/web3.js";
+import { Connection as SolanaConnection } from "@solana/web3.js";
 import type { Connection, TransactionInstruction } from "@solana/web3.js";
+import { resolveMainnetCAs, type MainnetAccountReader } from "../lib/mainnet-ca-validator.js";
 import {
   discoverMarkets,
   encodePermissionlessCrank,
@@ -45,6 +47,33 @@ import { isFeeCrankEnabled, runFeeCrankPass } from "./fee-crank.js";
 export type CrankResult = "success" | "skipped" | "failed";
 
 const logger = createLogger("keeper:crank");
+
+/**
+ * Lazily-built, cached mainnet connection used solely to verify `mainnet_ca`
+ * overrides (KEEPER-9). Deliberately separate from getConnection(): the keeper
+ * that actually uses mainnet_ca runs on devnet, so its own connection cannot
+ * resolve a mainnet mint. Returns null when MAINNET_RPC_URL is unset, in which
+ * case the validator degrades to a format check.
+ */
+let _mainnetReader: MainnetAccountReader | null | undefined;
+function getMainnetReader(): MainnetAccountReader | null {
+  if (_mainnetReader !== undefined) return _mainnetReader;
+  const url = process.env.MAINNET_RPC_URL;
+  if (!url) {
+    _mainnetReader = null;
+    return null;
+  }
+  const conn = new SolanaConnection(url, "confirmed");
+  _mainnetReader = {
+    getMultipleAccountsInfo: (keys) => conn.getMultipleAccountsInfo(keys, "confirmed"),
+  };
+  return _mainnetReader;
+}
+
+/** Test seam: drops the cached mainnet connection. */
+export function __resetMainnetReaderForTests(): void {
+  _mainnetReader = undefined;
+}
 
 /** Timeout for individual RPC calls — prevents indefinite hangs on unresponsive nodes. */
 const RPC_TIMEOUT_MS = 15_000;
@@ -1221,17 +1250,12 @@ export class CrankService {
         monitors.db.recordSuccess().catch(() => {});
       }
       if (data) {
-        const base58Re = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-        // M3: Validate each field independently — don't discard the entire row
-        // when only one field is invalid.
-        for (const row of data) {
-          let ca = row.mainnet_ca ?? undefined;
-          if (ca && !base58Re.test(ca)) {
-            logger.warn("Invalid mainnet_ca from Supabase, ignoring field", { slabAddress: row.slab_address, mainnetCA: ca });
-            ca = undefined;
-          }
-          dbMarkets.set(row.slab_address, { mainnetCA: ca });
-        }
+        // KEEPER-9: validate each mainnet_ca before it can become a price-lookup
+        // key in fraud-detector.ts. Verification runs against MAINNET, not
+        // getConnection(): mainnet_ca exists only for devnet mirror-mint markets,
+        // so checking it on the keeper's own network would look a mainnet mint up
+        // on devnet, find nothing, and reject every override.
+        dbMarkets = await resolveMainnetCAs(data, { reader: getMainnetReader() });
       }
     } catch (err) {
       logger.warn("Failed to fetch market metadata from Supabase", {
