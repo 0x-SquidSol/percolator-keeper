@@ -5,6 +5,7 @@ import {
 import { eventBus, createLogger, getErrorMessage, sendWarningAlert, sendCriticalAlert } from "@percolatorct/shared";
 import { isMainnet } from "../config/network.js";
 import { oraclePushCountTotal, oracleStalenessSeconds } from "../lib/metrics.js";
+import { monitors } from "../lib/service-monitors.js";
 
 const logger = createLogger("keeper:oracle");
 
@@ -204,8 +205,14 @@ export class OracleService {
       });
       clearTimeout(timeoutId);
 
-      if (!res.ok) return null;
-      
+      // BUG-110: record real connectivity outcomes so /health's monitors.oracle
+      // reflects whether the external price feeds are actually reachable.
+      if (!res.ok) {
+        monitors.oracle.recordFailure(`DexScreener HTTP ${res.status}`).catch(() => {});
+        return null;
+      }
+      monitors.oracle.recordSuccess().catch(() => {});
+
       const json = (await res.json()) as DexScreenerResponse;
 
       // M7: Validate BEFORE caching — don't cache bad responses that would
@@ -238,6 +245,7 @@ export class OracleService {
         mint,
         error: err instanceof Error ? err.message : String(err),
       });
+      monitors.oracle.recordFailure(err instanceof Error ? err.message : String(err)).catch(() => {});
       return null;
     }
   }
@@ -271,8 +279,13 @@ export class OracleService {
       });
       clearTimeout(timeoutId);
 
-      if (!res.ok) return null;
-      
+      // BUG-110: see fetchDexScreenerPrice — same connectivity signal for Jupiter.
+      if (!res.ok) {
+        monitors.oracle.recordFailure(`Jupiter HTTP ${res.status}`).catch(() => {});
+        return null;
+      }
+      monitors.oracle.recordSuccess().catch(() => {});
+
       const json = (await res.json()) as JupiterResponse;
       const priceStr = json.data?.[mint]?.price;
       if (!priceStr) return null;
@@ -288,6 +301,7 @@ export class OracleService {
         mint,
         error: err instanceof Error ? err.message : String(err),
       });
+      monitors.oracle.recordFailure(err instanceof Error ? err.message : String(err)).catch(() => {});
       return null;
     }
   }

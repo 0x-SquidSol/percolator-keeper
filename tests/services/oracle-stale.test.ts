@@ -12,34 +12,49 @@ vi.mock('@percolatorct/sdk', () => ({
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
 }));
 
-vi.mock('@percolatorct/shared', () => ({
-  config: {
-    programId: '11111111111111111111111111111111',
-    crankKeypair: 'mock-keypair-path',
-  },
-  createLogger: vi.fn(() => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  })),
-  getConnection: vi.fn(() => ({
-    getAccountInfo: vi.fn(),
-  })),
-  loadKeypair: vi.fn(() => ({
-    publicKey: new PublicKey('11111111111111111111111111111111'),
-    secretKey: new Uint8Array(64),
-  })),
-  sendWithRetry: vi.fn(async () => 'mock-signature'),
-  eventBus: {
-    publish: vi.fn(),
-  },
-  getErrorMessage: vi.fn((err: unknown) => {
-    if (err instanceof Error) return err.message;
-    return String(err);
-  }),
-  sendWarningAlert: vi.fn(() => Promise.resolve()),
-}));
+vi.mock('@percolatorct/shared', () => {
+  const makeMonitor = () => ({
+    recordSuccess: vi.fn(async () => {}),
+    recordFailure: vi.fn(async () => {}),
+    getErrorRate: vi.fn(() => 0),
+    getStatus: vi.fn(() => ({ healthy: true, consecutiveFailures: 0, errorRate: 0, timeSinceSuccessMs: 0, alertActive: false })),
+  });
+  return {
+    config: {
+      programId: '11111111111111111111111111111111',
+      crankKeypair: 'mock-keypair-path',
+    },
+    createLogger: vi.fn(() => ({
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    })),
+    getConnection: vi.fn(() => ({
+      getAccountInfo: vi.fn(),
+    })),
+    loadKeypair: vi.fn(() => ({
+      publicKey: new PublicKey('11111111111111111111111111111111'),
+      secretKey: new Uint8Array(64),
+    })),
+    sendWithRetry: vi.fn(async () => 'mock-signature'),
+    eventBus: {
+      publish: vi.fn(),
+    },
+    getErrorMessage: vi.fn((err: unknown) => {
+      if (err instanceof Error) return err.message;
+      return String(err);
+    }),
+    sendWarningAlert: vi.fn(() => Promise.resolve()),
+    // BUG-110: src/lib/service-monitors.ts calls this at import time.
+    createServiceMonitors: vi.fn(() => ({
+      rpc: makeMonitor(),
+      scan: makeMonitor(),
+      oracle: makeMonitor(),
+      db: makeMonitor(),
+    })),
+  };
+});
 
 import { OracleService } from '../../src/services/oracle.js';
 

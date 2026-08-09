@@ -1,7 +1,8 @@
 import "dotenv/config";
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, createServiceMonitors, getConnection, loadKeypair } from "@percolatorct/shared";
+import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, getConnection, loadKeypair } from "@percolatorct/shared";
+import { monitors } from "./lib/service-monitors.js";
 import { OracleService } from "./services/oracle.js";
 import { CrankService } from "./services/crank.js";
 import { LiquidationService } from "./services/liquidation.js";
@@ -27,8 +28,8 @@ import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harne
 import { sharedDecisionLog } from "./lib/decision-log.js";
 import { createLaserStreamAccountLoader } from "./lib/laserstream-entrypoint.js";
 
-// Monitoring — alerts to Discord on threshold breaches
-export const monitors = createServiceMonitors("Keeper");
+// Monitoring — alerts to Discord on threshold breaches (see src/lib/service-monitors.ts)
+export { monitors };
 
 // Initialize Sentry first
 initSentry("keeper");
@@ -165,6 +166,10 @@ const solBalanceCheckInterval = setInterval(async () => {
     _keeperSolBalanceLamports = lamports;
     const solBalance = lamports / 1e9;
     walletBalanceSol.set(solBalance);
+    // BUG-110: this periodic getBalance is a real, regular RPC round trip —
+    // record it so /health's monitors.rpc reflects actual connectivity
+    // instead of permanently-green placeholder data.
+    monitors.rpc.recordSuccess().catch(() => {});
 
     if (solBalance < SOL_BALANCE_WARN_THRESHOLD) {
       // Rate-limit alerts to once per 5 minutes to avoid Discord spam
@@ -188,6 +193,7 @@ const solBalanceCheckInterval = setInterval(async () => {
     logger.warn("Failed to fetch keeper SOL balance", {
       error: err instanceof Error ? err.message : String(err),
     });
+    monitors.rpc.recordFailure(err instanceof Error ? err.message : String(err)).catch(() => {});
   }
 }, 60_000);
 solBalanceCheckInterval.unref();

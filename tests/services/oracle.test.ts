@@ -12,38 +12,54 @@ vi.mock('@percolatorct/sdk', () => ({
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
 }));
 
-vi.mock('@percolatorct/shared', () => ({
-  config: {
-    programId: '11111111111111111111111111111111',
-    crankKeypair: 'mock-keypair-path',
-  },
-  createLogger: vi.fn(() => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  })),
-  getConnection: vi.fn(() => ({
-    getAccountInfo: vi.fn(),
-  })),
-  loadKeypair: vi.fn(() => ({
-    publicKey: new PublicKey('11111111111111111111111111111111'),
-    secretKey: new Uint8Array(64),
-  })),
-  sendWithRetry: vi.fn(async () => 'mock-signature'),
-  eventBus: {
-    publish: vi.fn(),
-  },
-  getErrorMessage: vi.fn((err: unknown) => {
-    if (err instanceof Error) return err.message;
-    return String(err);
-  }),
-  sendWarningAlert: vi.fn(),
-  sendCriticalAlert: vi.fn(),
-}));
+vi.mock('@percolatorct/shared', () => {
+  const makeMonitor = () => ({
+    recordSuccess: vi.fn(async () => {}),
+    recordFailure: vi.fn(async () => {}),
+    getErrorRate: vi.fn(() => 0),
+    getStatus: vi.fn(() => ({ healthy: true, consecutiveFailures: 0, errorRate: 0, timeSinceSuccessMs: 0, alertActive: false })),
+  });
+  return {
+    config: {
+      programId: '11111111111111111111111111111111',
+      crankKeypair: 'mock-keypair-path',
+    },
+    createLogger: vi.fn(() => ({
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    })),
+    getConnection: vi.fn(() => ({
+      getAccountInfo: vi.fn(),
+    })),
+    loadKeypair: vi.fn(() => ({
+      publicKey: new PublicKey('11111111111111111111111111111111'),
+      secretKey: new Uint8Array(64),
+    })),
+    sendWithRetry: vi.fn(async () => 'mock-signature'),
+    eventBus: {
+      publish: vi.fn(),
+    },
+    getErrorMessage: vi.fn((err: unknown) => {
+      if (err instanceof Error) return err.message;
+      return String(err);
+    }),
+    sendWarningAlert: vi.fn(),
+    sendCriticalAlert: vi.fn(),
+    // BUG-110: src/lib/service-monitors.ts calls this at import time.
+    createServiceMonitors: vi.fn(() => ({
+      rpc: makeMonitor(),
+      scan: makeMonitor(),
+      oracle: makeMonitor(),
+      db: makeMonitor(),
+    })),
+  };
+});
 
 import { OracleService } from '../../src/services/oracle.js';
 import * as shared from '@percolatorct/shared';
+import { monitors } from '../../src/lib/service-monitors.js';
 
 describe('OracleService', () => {
   let oracleService: OracleService;
@@ -124,6 +140,38 @@ describe('OracleService', () => {
       const price = await oracleService.fetchDexScreenerPrice('MINT_TIMEOUT');
 
       expect(price).toBeNull();
+    });
+
+    // BUG-110: monitors.oracle was never wired to a real outcome -- /health's
+    // monitors.oracle sub-object was permanently-green placeholder data.
+    it('BUG-110: records monitors.oracle success on a reachable fetch', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ pairs: [{ priceUsd: '1.23', liquidity: { usd: 100000 } }] }),
+      } as any);
+
+      await oracleService.fetchDexScreenerPrice('MINT_MONITOR_OK');
+
+      expect(monitors.oracle.recordSuccess).toHaveBeenCalledTimes(1);
+      expect(monitors.oracle.recordFailure).not.toHaveBeenCalled();
+    });
+
+    it('BUG-110: records monitors.oracle failure on a network error', async () => {
+      vi.mocked(fetch).mockRejectedValueOnce(new Error('Network error'));
+
+      await oracleService.fetchDexScreenerPrice('MINT_MONITOR_FAIL');
+
+      expect(monitors.oracle.recordFailure).toHaveBeenCalledTimes(1);
+      expect(monitors.oracle.recordSuccess).not.toHaveBeenCalled();
+    });
+
+    it('BUG-110: records monitors.oracle failure on a non-ok HTTP response', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 429 } as any);
+
+      await oracleService.fetchDexScreenerPrice('MINT_MONITOR_429');
+
+      expect(monitors.oracle.recordFailure).toHaveBeenCalledWith('DexScreener HTTP 429');
+      expect(monitors.oracle.recordSuccess).not.toHaveBeenCalled();
     });
   });
 

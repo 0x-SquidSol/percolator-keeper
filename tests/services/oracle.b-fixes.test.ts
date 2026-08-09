@@ -54,6 +54,11 @@ vi.mock("@percolatorct/shared", () => ({
     err instanceof Error ? err.message : String(err),
   ),
   sendWarningAlert: hoisted.sendWarningAlert,
+  // BUG-110: src/lib/service-monitors.ts calls this at import time.
+  createServiceMonitors: vi.fn(() => {
+    const m = () => ({ recordSuccess: vi.fn(async () => {}), recordFailure: vi.fn(async () => {}), getErrorRate: vi.fn(() => 0), getStatus: vi.fn(() => ({ healthy: true, consecutiveFailures: 0, errorRate: 0, timeSinceSuccessMs: 0, alertActive: false })) });
+    return { rpc: m(), scan: m(), oracle: m(), db: m() };
+  }),
 }));
 
 const loggerWarn = hoisted.loggerWarn;

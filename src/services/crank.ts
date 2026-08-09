@@ -33,6 +33,7 @@ import {
   txLandTimeSeconds,
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
+import { monitors } from "../lib/service-monitors.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { parseV17RiskParams, V17_RISK_PARAMS_MIN_DATA_LEN } from "../lib/v17-risk.js";
@@ -1205,6 +1206,10 @@ export class CrankService {
         .in("slab_address", slabAddresses);
       if (error) {
         logger.warn("Supabase market metadata query error", { error: error.message });
+        // BUG-110: record so /health's monitors.db reflects real DB outcomes.
+        monitors.db.recordFailure(error.message).catch(() => {});
+      } else {
+        monitors.db.recordSuccess().catch(() => {});
       }
       if (data) {
         const base58Re = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1223,6 +1228,7 @@ export class CrankService {
       logger.warn("Failed to fetch market metadata from Supabase", {
         error: err instanceof Error ? err.message : String(err),
       });
+      monitors.db.recordFailure(err instanceof Error ? err.message : String(err)).catch(() => {});
     }
 
     const discoveredKeys = new Set<string>();
@@ -2110,8 +2116,12 @@ export class CrankService {
             });
           }
         }
+        // BUG-110: the cycle (discovery + crank pass) completed without
+        // throwing — record so /health's monitors.scan reflects real outcomes.
+        monitors.scan.recordSuccess().catch(() => {});
       } catch (err) {
         logger.error("Crank cycle failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
+        monitors.scan.recordFailure(err instanceof Error ? err.message : String(err)).catch(() => {});
       } finally {
         this._cycling = false;
         // H4: disarm the watchdog on natural recovery so a transient slow
