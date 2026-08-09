@@ -624,6 +624,17 @@ export class LiquidationService {
   /** Per-account debounce timers: slab pubkey → setTimeout handle. */
   private readonly _debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly _DEBOUNCE_MS = 1_000;
+  // BUG-104: the debounce above only coalesces updates *within* one window --
+  // it does not bound the sustained rate of distinct windows. Rapid
+  // open/close/reopen on a single account re-arms a fresh 1s timer each time,
+  // so an owner toggling state just over 1s apart (well under the 60s polling
+  // interval) can force a full scanMarket() + pre-submit RPC fan-out on every
+  // window, far more often than one polling cycle would. This map tracks the
+  // last time an event-driven scan actually ran per market, so a window that
+  // fires too soon after the previous one is deferred (not dropped) instead
+  // of executing immediately.
+  private readonly _lastEventScanAt = new Map<string, number>();
+  private static readonly MIN_EVENT_SCAN_INTERVAL_MS = 5_000;
   private _unsubLoader?: () => void;
   // C1 (post-mainnet-audit): per-cycle dedup keyed on the unique on-chain
   // liquidation target. Legacy slabs use (slabAddress, accountIdx); v17 markets
@@ -1559,6 +1570,50 @@ export class LiquidationService {
     return { scanned, candidates: candidateCount, liquidated };
   }
 
+  /**
+   * BUG-104: runs (or defers) the event-driven scan for one market once its
+   * debounce window has settled. If a scan for this market already ran more
+   * recently than MIN_EVENT_SCAN_INTERVAL_MS, reschedules for the remaining
+   * wait instead of firing immediately or dropping the trigger -- bounding
+   * the worst-case event-scan rate per market without ever silently missing
+   * an update.
+   */
+  private _maybeRunEventScan(slabKey: string, market: DiscoveredMarket): void {
+    const now = Date.now();
+    const last = this._lastEventScanAt.get(slabKey) ?? 0;
+    const elapsed = now - last;
+    if (elapsed < LiquidationService.MIN_EVENT_SCAN_INTERVAL_MS) {
+      const remaining = LiquidationService.MIN_EVENT_SCAN_INTERVAL_MS - elapsed;
+      this._debounceTimers.set(
+        slabKey,
+        setTimeout(() => this._maybeRunEventScan(slabKey, market), remaining),
+      );
+      return;
+    }
+    this._lastEventScanAt.set(slabKey, now);
+    this._debounceTimers.delete(slabKey);
+    // Single-market scan — fire-and-forget; errors logged inside scanMarket.
+    this.scanMarket(market).then(async (candidates) => {
+      for (const c of candidates) {
+        // #218: route through the shared gate so the event path honors the same
+        // per-cycle dedup + per-owner cap as the polling path (no double-liquidation).
+        const sig = await this.gatedLiquidate(market, c);
+        if (sig) {
+          logger.info("Event-driven liquidation complete", {
+            slabAddress: slabKey,
+            accountIdx: c.accountIdx,
+            signature: sig,
+          });
+        }
+      }
+    }).catch((err: unknown) => {
+      logger.warn("Event-driven scan/liquidate failed", {
+        slabAddress: slabKey,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
   start(getMarkets: () => Map<string, { market: DiscoveredMarket }>): void {
     if (this.timer) return;
     logger.info("Liquidation service starting", { intervalMs: this.intervalMs });
@@ -1643,29 +1698,7 @@ export class LiquidationService {
         if (existing) clearTimeout(existing);
         this._debounceTimers.set(
           slabKey,
-          setTimeout(() => {
-            this._debounceTimers.delete(slabKey);
-            // Single-market scan — fire-and-forget; errors logged inside scanMarket.
-            this.scanMarket(market.market).then(async (candidates) => {
-              for (const c of candidates) {
-                // #218: route through the shared gate so the event path honors the same
-                // per-cycle dedup + per-owner cap as the polling path (no double-liquidation).
-                const sig = await this.gatedLiquidate(market.market, c);
-                if (sig) {
-                  logger.info("Event-driven liquidation complete", {
-                    slabAddress: slabKey,
-                    accountIdx: c.accountIdx,
-                    signature: sig,
-                  });
-                }
-              }
-            }).catch((err: unknown) => {
-              logger.warn("Event-driven scan/liquidate failed", {
-                slabAddress: slabKey,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            });
-          }, this._DEBOUNCE_MS),
+          setTimeout(() => this._maybeRunEventScan(slabKey, market.market), this._DEBOUNCE_MS),
         );
       });
       logger.info("Liquidation service: event-driven mode active", {
