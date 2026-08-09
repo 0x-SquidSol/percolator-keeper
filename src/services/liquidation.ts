@@ -1,3 +1,4 @@
+import { LRUCache } from "lru-cache";
 import { PublicKey, TransactionInstruction, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   fetchSlab,
@@ -662,6 +663,38 @@ export class LiquidationService {
   // gatedLiquidate is the sole entry point for both the polling path and the
   // LaserStream event path, so guarding here covers both unconditionally.
   private readonly _inFlightPositions = new Set<string>();
+  // BUG-103: per-position failure backoff. _cycleSeenPositions/_inFlightPositions
+  // only prevent *concurrent* double-submission within or across one cycle --
+  // neither remembers that a liquidate() attempt for a given position failed,
+  // so a position whose submitted liquidation keeps reverting gets re-attempted
+  // at full tx-fee cost on every polling cycle.
+  //
+  // Armed ONLY when a transaction was actually broadcast (see _submitAttempts)
+  // and the budget breaker is not halted. Both exclusions matter:
+  //   - Every pre-submit `return null` in liquidate() (oracle-drift guard, the
+  //     #373 fail-closed re-verification, "no longer undercollateralized") sits
+  //     above recordAttempt() and costs no fee. Backing off on those would blind
+  //     the keeper to a genuinely underwater position because an RPC call failed.
+  //   - A halted budget makes keeperSend return null for EVERY position
+  //     (keeper-send.ts: `if (!budget.canSpend(...)) return null`), so arming
+  //     there would put the entire book into escalating cooldown at once and
+  //     keep the keeper idle well past the operator's resume().
+  //
+  // LRU-bounded: entries are only deleted on a landed liquidation, so a position
+  // closed by its owner or liquidated by someone else would otherwise leave its
+  // entry behind for the life of the process.
+  private readonly _positionBackoff = new LRUCache<string, { failures: number; retryAfter: number }>({
+    max: 2_000,
+  });
+  private static readonly POSITION_BACKOFF_BASE_MS = 5_000;
+  // 60s, not the 5 minutes originally proposed: a position that is genuinely
+  // liquidatable must not be ignored long enough for a cascade to accrue bad
+  // debt the protocol then absorbs.
+  private static readonly POSITION_BACKOFF_MAX_MS = 60_000;
+  // Incremented in liquidate() at the recordAttempt() line, i.e. once the tx is
+  // about to go to keeperSend. gatedLiquidate compares this across the call to
+  // tell "broadcast and failed" from "aborted before broadcasting".
+  private _submitAttempts = 0;
   // B5: collapse per-liquidation Discord alerts into a single summary alert per
   // market within a 5 s window — prevents cascade-driven channel flooding.
   private readonly _liquidationAlertAggregator = new AlertAggregator(
@@ -975,6 +1008,18 @@ export class LiquidationService {
       });
       return null;
     }
+    // BUG-103: a position that keeps failing gets an escalating cooldown
+    // instead of an unconditional retry on every cycle/event.
+    const backoff = this._positionBackoff.get(positionKey);
+    if (backoff && Date.now() < backoff.retryAfter) {
+      logger.debug("Skipping position in per-position failure backoff", {
+        positionKey,
+        owner: candidate.owner.slice(0, 8),
+        failures: backoff.failures,
+        retryInMs: backoff.retryAfter - Date.now(),
+      });
+      return null;
+    }
     if (this._cycleSeenPositions.has(positionKey)) {
       logger.debug("Skipping position already targeted this cycle", {
         positionKey,
@@ -994,13 +1039,40 @@ export class LiquidationService {
     this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
     this._inFlightPositions.add(positionKey);
     try {
-      return (await this.liquidate(
-        market,
-        candidate.accountIdx,
-        candidate.v17PortfolioPubkey,
-        candidate.scanPriceE6,
-        candidate.closeQ ?? 0n,
-      )) ?? null;
+      const attemptsBefore = this._submitAttempts;
+      const sig =
+        (await this.liquidate(
+          market,
+          candidate.accountIdx,
+          candidate.v17PortfolioPubkey,
+          candidate.scanPriceE6,
+          candidate.closeQ ?? 0n,
+        )) ?? null;
+      // Did a transaction actually reach the wire? Everything that returns null
+      // above recordAttempt() cost an RPC call, not a fee, and must not throttle
+      // a position that may still be underwater.
+      const broadcast = this._submitAttempts > attemptsBefore;
+      if (sig) {
+        // BUG-103: a landed liquidation clears any prior failure history --
+        // the position is gone, and a future reuse of this key (a new
+        // position at the same slot) deserves a clean slate.
+        this._positionBackoff.delete(positionKey);
+      } else if (broadcast && !sharedBudget.isHalted()) {
+        const prev = this._positionBackoff.get(positionKey);
+        const failures = (prev?.failures ?? 0) + 1;
+        // The first failure is free (immediate retry permitted) -- a single
+        // recheck-abort (oracle moved, owner topped up once) is routine and
+        // must not delay a position that's still genuinely liquidatable.
+        // Backoff only escalates once a position has failed repeatedly.
+        const delay = failures <= 1
+          ? 0
+          : Math.min(
+              LiquidationService.POSITION_BACKOFF_BASE_MS * Math.pow(2, failures - 2),
+              LiquidationService.POSITION_BACKOFF_MAX_MS,
+            );
+        this._positionBackoff.set(positionKey, { failures, retryAfter: Date.now() + delay });
+      }
+      return sig;
     } finally {
       // Always release, regardless of success, a returned null (race-
       // condition abort inside liquidate()), or an unexpected thrown error.
@@ -1385,6 +1457,10 @@ export class LiquidationService {
       //   - Multi-RPC parallel broadcast (+20-40% landing rate)
       //   - Simulation-based tight CU limit (better queue position)
       const __t0 = Date.now();
+      // BUG-103: everything above this line is a pre-submit abort. Past it we are
+      // committed to putting a transaction on the wire, so this is the point that
+      // distinguishes "cost us a fee" from "cost us an RPC call".
+      this._submitAttempts++;
       recordAttempt();
       let sig: string;
       try {
