@@ -17,7 +17,8 @@ import {
   parsePortfolioV17,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
-import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, sendCriticalAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
+import { config, getConnection, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, sendCriticalAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
+import { getKeeperKeypair } from "../lib/keypair-singleton.js";
 import { OracleService } from "./oracle.js";
 import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { isCustomProgramError } from "../lib/program-error.js";
@@ -618,8 +619,11 @@ export class LiquidationService {
   // (which collapses bursts within a few seconds, not a level held for hours).
   private readonly _corruptedRiskParamsAlertedAt = new Map<string, number>();
   private static readonly RISK_PARAMS_ALERT_COOLDOWN_MS = 15 * 60_000; // 15 min
-  // Cache keypair at construction — avoids re-parsing from env on every liquidate() call
-  private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+  // Use the process-wide keypair singleton — avoids a second secretKey allocation.
+  // Eager, not a lazy getter — see the matching note in crank.ts: deferring
+  // resolution would turn a boot-time misconfiguration into a first-liquidation
+  // failure, which is exactly the degraded state index.ts warns about.
+  private readonly _keypair = getKeeperKeypair();
   /** LaserStream account loader — injected for event-driven portfolio scanning. */
   private readonly _accountLoader?: AccountLoader;
   /** Per-account debounce timers: slab pubkey → setTimeout handle. */
