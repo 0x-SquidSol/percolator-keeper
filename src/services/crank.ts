@@ -25,6 +25,7 @@ import {
 import { config, getConnection, getFallbackConnection, loadKeypair, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
+import { isCustomProgramError } from "../lib/program-error.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import {
   txSentTotal,
@@ -512,7 +513,9 @@ async function provisionKeeperPortfolio(
   } catch (provisionErr) {
     const errMsg = provisionErr instanceof Error ? provisionErr.message : String(provisionErr);
     // AlreadyInitialized: a concurrent provision beat us; re-query for the existing portfolio.
-    if (errMsg.includes("AlreadyInitialized") || errMsg.includes("custom program error: 0x0")) {
+    // Exact-code match on 0x0 — a substring check also caught 0x00–0x0f (codes 1–15),
+    // misrouting an unrelated failure into this re-query path.
+    if (errMsg.includes("AlreadyInitialized") || isCustomProgramError(errMsg, 0x0)) {
       logger.info("provisionKeeperPortfolio: AlreadyInitialized — re-querying for existing portfolio", {
         market: marketKeyBase58.slice(0, 8),
       });
@@ -1632,9 +1635,11 @@ export class CrankService {
         });
       }
 
-      // Detect NotInitialized (error 0x4) — permanently skip these markets
-      // PERC-381: Track skip count and timestamp for exponential cooldown on rediscovery
-      if (errMsg.includes("custom program error: 0x4")) {
+      // Detect InvalidSlabLen (error 0x4) — permanently skip these markets.
+      // PERC-381: Track skip count and timestamp for exponential cooldown on rediscovery.
+      // Exact-code match: a substring check would also catch 0x40–0x4f / 0x400+
+      // and permanently skip a healthy market on an unrelated engine error.
+      if (isCustomProgramError(errMsg, 0x4)) {
         state.permanentlySkipped = true;
         state.permanentlySkippedAt = Date.now();
         state.skipCount = (state.skipCount ?? 0) + 1;
