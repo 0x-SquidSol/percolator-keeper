@@ -80,6 +80,13 @@ function getCuEstimator(): CuEstimator {
 export const sharedBudget = new KeeperBudget(
   {},
   {
+    // BUG-106: persist a latched halt to disk so a crash/restart (the common
+    // case — same container/filesystem, e.g. an uncaught exception or an
+    // orchestrator-driven OOM restart) keeps the keeper halted instead of
+    // silently resuming spend into whatever condition tripped the breaker.
+    // A full container recreate on an ephemeral filesystem is not covered;
+    // operators wanting that can point this at a mounted persistent volume.
+    haltStatePath: process.env.KEEPER_BUDGET_HALT_STATE_PATH ?? "/tmp/keeper-budget-halt.json",
     onHalt: (kind, reason) => {
       budgetHalted.set(1);
       logger.error("KeeperBudget circuit-breaker halted — refusing all sends until resume", {
