@@ -76,6 +76,7 @@ export interface LeaderLockOptions {
   ttlMs?: number;
   renewMs?: number;
   pollMs?: number;
+  renewTimeoutMs?: number;
 }
 
 export interface StartOptions {
@@ -90,10 +91,12 @@ export class LeaderLock {
   private readonly ttlMs: number;
   private readonly renewMs: number;
   private readonly pollMs: number;
+  private readonly renewTimeoutMs: number;
 
   private _role: LeaderRole = "starting";
   private _renewTimer: NodeJS.Timeout | null = null;
   private _pollTimer: NodeJS.Timeout | null = null;
+  private _leaseTimer: NodeJS.Timeout | null = null;
   private _renewFailures = 0;
   private _lockKey = "";
   private _onDemote: ((reason: string) => void) | null = null;
@@ -134,6 +137,11 @@ export class LeaderLock {
     this.ttlMs = ttlMs;
     this.renewMs = renewMs;
     this.pollMs = pollMs;
+    // Bound each renew RPC so a hung Redis fetch cannot stall the renew loop
+    // forever. Kept at/below renewMs so a timed-out renew still leaves room to
+    // retry (and strike-demote) before the lease-expiry watchdog fires.
+    // Reads the validated local, not opts, so it inherits #377's timing checks.
+    this.renewTimeoutMs = opts.renewTimeoutMs ?? Math.min(renewMs, 5_000);
   }
 
   role(): LeaderRole {
@@ -182,10 +190,13 @@ export class LeaderLock {
     const ttlSec = Math.ceil(this.ttlMs / 1000);
 
     try {
+      // Stamp before the SET so the watchdog deadline is measured from when the
+      // lease request was issued (see _armLeaseWatchdog).
+      const acquiredAt = Date.now();
       const result = await this.redis.set(this._lockKey, this.identity, { ex: ttlSec, nx: true } as { ex: number; nx: true });
 
       if (result === "OK") {
-        this._promote(opts);
+        this._promote(opts, acquiredAt);
       } else {
         this._enterStandby(opts);
       }
@@ -198,11 +209,15 @@ export class LeaderLock {
     }
   }
 
-  private _promote(opts: StartOptions): void {
+  private _promote(opts: StartOptions, leaseIssuedAt: number): void {
     if (this._stopped) return;
     this._role = "leader";
     this._renewFailures = 0;
     logger.info("LeaderLock promoted to leader", { identity: this.identity });
+    // Arm the lease watchdog before firing onPromote so the split-brain guard is
+    // live even if the handler throws (mirrors _demote arming the poll first).
+    // leaseIssuedAt is when the acquiring SET NX was issued, not when _promote runs.
+    this._armLeaseWatchdog(leaseIssuedAt);
     opts.onPromote();
     this._scheduleRenew(opts);
   }
@@ -212,6 +227,55 @@ export class LeaderLock {
       await this._renew(opts);
     }, this.renewMs);
     this._renewTimer.unref?.();
+  }
+
+  // Lease-expiry watchdog. The Redis lock expires ttlMs after Redis EXECUTES our
+  // acquire/renew, which happens between our request and its response. We measure
+  // the deadline from when the request was ISSUED (`leaseIssuedAt`), not when it
+  // resolved: measuring from issue time is conservative (arms slightly early,
+  // never late), so a slow-but-not-hung Redis — a renewal that succeeds just
+  // under renewTimeoutMs — cannot leave us believing we still hold a lease that
+  // has, on Redis's clock, already expired (which would open a dual-leader window
+  // up to renewTimeoutMs wide). If we cannot confirm a renewal before the
+  // deadline — the eval hangs, times out repeatedly, or errors — we MUST
+  // relinquish leadership so a standby that acquires the now-free lock is the
+  // only writer. This is the hard guarantee behind the 2-strike renew counter.
+  // Armed on promotion and re-armed on every successful renewal.
+  private _armLeaseWatchdog(leaseIssuedAt: number): void {
+    if (this._leaseTimer) clearTimeout(this._leaseTimer);
+    const remainingMs = Math.max(0, this.ttlMs - (Date.now() - leaseIssuedAt));
+    this._leaseTimer = setTimeout(() => {
+      if (this._stopped || this._role !== "leader") return;
+      logger.error(
+        "LeaderLock lease watchdog fired — no successful renewal within ttlMs; demoting to prevent split-brain",
+        { identity: this.identity, ttlMs: this.ttlMs },
+      );
+      this._demote("lease-expired");
+    }, remainingMs);
+    this._leaseTimer.unref?.();
+  }
+
+  // Bound the renew eval so a hung Redis request cannot stall the renew loop
+  // indefinitely (which would leave _role === "leader" forever). A timeout is
+  // surfaced as a thrown error, taking the same strike/demote path as any other
+  // transient transport failure.
+  private async _evalRenewWithTimeout(): Promise<number | null> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`Redis renew timed out after ${this.renewTimeoutMs}ms`)),
+        this.renewTimeoutMs,
+      );
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([
+        this.redis.eval<number | null>(RENEW_SCRIPT, [this._lockKey], [this.identity, this.ttlMs]),
+        timeout,
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async _renew(opts: StartOptions): Promise<void> {
@@ -224,14 +288,22 @@ export class LeaderLock {
       // or key gone). Identity mismatch is a definitive loss of lease and
       // demotes IMMEDIATELY — it is NOT a transient error and must bypass the
       // 2-strike counter (which is reserved for thrown transport errors).
-      const result = await this.redis.eval<number | null>(
-        RENEW_SCRIPT,
-        [this._lockKey],
-        [this.identity, this.ttlMs],
-      );
+      // Bounded by a timeout so a hung Redis cannot stall this await forever.
+      // Stamp before the eval so the watchdog deadline is measured from when the
+      // renew request was issued, not when Redis replied (see _armLeaseWatchdog).
+      const issuedAt = Date.now();
+      const result = await this._evalRenewWithTimeout();
+
+      // A hung/slow eval may resolve after a concurrent stop() or after the
+      // lease watchdog already demoted us — never act on a stale result or
+      // re-arm timers on a node that is no longer leader.
+      if (this._stopped || this._role !== "leader") return;
 
       if (result === 1) {
         this._renewFailures = 0;
+        // Fresh lease confirmed — push the split-brain watchdog out, dated from
+        // when Redis received the renew (issuedAt), not from now.
+        this._armLeaseWatchdog(issuedAt);
         this._scheduleRenew(opts);
         return;
       }
@@ -262,9 +334,15 @@ export class LeaderLock {
         this._scheduleRenew(opts);
       }
     } catch (err) {
-      // Transient transport error (network blip, 5xx, rate-limit). Preserve
-      // the existing 2-strike tolerance — this is the path the M15 finding
-      // discusses; tightening it is a separate PR.
+      // A concurrent stop() or lease-watchdog demotion may have already moved us
+      // out of leader while the eval/timeout was in flight — do not strike or
+      // re-arm a renew on a non-leader.
+      if (this._stopped || this._role !== "leader") return;
+
+      // Transient transport error (network blip, 5xx, rate-limit) or a renew
+      // timeout. The 2-strike tolerance still applies for a responsive fast
+      // demote; the lease watchdog is the backstop that guarantees demotion by
+      // the lease deadline even if strikes accrue more slowly than the TTL.
       this._renewFailures++;
       logger.warn("LeaderLock renew error", {
         identity: this.identity,
@@ -306,10 +384,11 @@ export class LeaderLock {
 
       if (current === null) {
         const ttlSec = Math.ceil(this.ttlMs / 1000);
+        const acquiredAt = Date.now();
         const result = await this.redis.set(this._lockKey, this.identity, { ex: ttlSec, nx: true } as { ex: number; nx: true });
         if (this._stopped || this._role !== "standby") return;
         if (result === "OK") {
-          this._promote(opts);
+          this._promote(opts, acquiredAt);
           return;
         }
       }
@@ -349,6 +428,10 @@ export class LeaderLock {
     if (this._pollTimer) {
       clearTimeout(this._pollTimer);
       this._pollTimer = null;
+    }
+    if (this._leaseTimer) {
+      clearTimeout(this._leaseTimer);
+      this._leaseTimer = null;
     }
   }
 }
